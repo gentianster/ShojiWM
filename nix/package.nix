@@ -121,9 +121,9 @@ rustPlatform.buildRustPackage {
       "smithay-drm-extras-0.1.0" = "sha256-l2IXXk5kaiUzXPc8JFCW7POxvHRDfiFNE1nq5OaT6QQ=";
       "rustyscript-0.12.3" = "sha256-04yZws8aY6NpyQc0F6fg7CAwYYXer7r+eFABwafP+kU=";
       # The embedded xwayland-satellite and its workspace crates (one checkout).
-      "xwayland-satellite-0.8.2" = "sha256-844gZMJs14lbedTdXlaZR2E0uk5AoJHPA6Pzp3GSg6U=";
-      "macros-0.1.0" = "sha256-844gZMJs14lbedTdXlaZR2E0uk5AoJHPA6Pzp3GSg6U=";
-      "wl_drm-0.1.0" = "sha256-844gZMJs14lbedTdXlaZR2E0uk5AoJHPA6Pzp3GSg6U=";
+      "xwayland-satellite-0.8.2" = "sha256-WqUm4BdgPY70EQXCn50SlpfsHzBYEteLqU4+zj8r57w=";
+      "macros-0.1.0" = "sha256-WqUm4BdgPY70EQXCn50SlpfsHzBYEteLqU4+zj8r57w=";
+      "wl_drm-0.1.0" = "sha256-WqUm4BdgPY70EQXCn50SlpfsHzBYEteLqU4+zj8r57w=";
     };
   };
 

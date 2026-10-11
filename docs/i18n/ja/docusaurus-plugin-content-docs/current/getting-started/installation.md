@@ -61,8 +61,10 @@ sudo pacman -S wayland libxkbcommon systemd-libs libinput mesa seatd libxcb \
 ShojiWM は X11 アプリを
 [`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite) で動かします。
 xwayland-satellite は ShojiWM に内蔵されています。
-[`bea4dev/xwayland-satellite`](https://github.com/bea4dev/xwayland-satellite/tree/shojiwm)
-の `shojiwm` ブランチにある ShojiWM 専用フォークを、コンポジターの中で動かすため、
+このビルドでは、混在 DPI の修正を含む ShojiWM 専用フォーク
+[`gentianster/xwayland-satellite`](https://github.com/gentianster/xwayland-satellite)
+のコミット [`4a1a222`](https://github.com/gentianster/xwayland-satellite/commit/4a1a222f73f34326104b23e9c5fe6ebd54b6f8f6)
+に依存を固定しています。コンポジターの中で動かすため、
 `xwayland` 以外に別途インストールするものはありません。Xwayland が停止した場合は、
 ShojiWM が同じ `DISPLAY` で自動的に起動し直します。
 
