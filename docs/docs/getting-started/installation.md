@@ -63,9 +63,10 @@ sudo pacman -S wayland libxkbcommon systemd-libs libinput mesa seatd libxcb \
 :::note[X11 applications]
 ShojiWM runs X11 applications through
 [`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite), which is
-built into ShojiWM: it uses the ShojiWM-specific fork on the `shojiwm` branch of
-[`bea4dev/xwayland-satellite`](https://github.com/bea4dev/xwayland-satellite/tree/shojiwm)
-and runs inside the compositor, so there is nothing to install besides
+built into ShojiWM. This build pins the ShojiWM-specific fork
+[`gentianster/xwayland-satellite`](https://github.com/gentianster/xwayland-satellite)
+to commit [`4a1a222`](https://github.com/gentianster/xwayland-satellite/commit/4a1a222f73f34326104b23e9c5fe6ebd54b6f8f6)
+for the mixed-DPI fixes. It runs inside the compositor, so there is nothing to install besides
 `xwayland`. If Xwayland stops, ShojiWM restarts it on the same `DISPLAY`.
 
 For debugging, a separately installed `xwayland-satellite` can be run as its own

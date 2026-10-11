@@ -22,8 +22,8 @@ smithay-drm-extras = {
 # `xwayland_satellite.rs`). Renamed so the crate does not clash with that module.
 satellite = {
     package = "xwayland-satellite",
-    git = "https://github.com/bea4dev/xwayland-satellite.git",
-    rev = "d995e79977d63e30e556302a347c6df8b7fd0961"
+    git = "https://github.com/gentianster/xwayland-satellite.git",
+    rev = "4a1a222f73f34326104b23e9c5fe6ebd54b6f8f6"
 }
 wayland-protocols = { version = "0.32.12", features = ["server", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
