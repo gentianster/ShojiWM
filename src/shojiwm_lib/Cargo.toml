@@ -23,7 +23,7 @@ smithay-drm-extras = {
 satellite = {
     package = "xwayland-satellite",
     git = "https://github.com/gentianster/xwayland-satellite.git",
-    rev = "8fbdf47f32f266721ccaeeb368306179be8926c3"
+    rev = "4a1a222f73f34326104b23e9c5fe6ebd54b6f8f6"
 }
 wayland-protocols = { version = "0.32.12", features = ["server", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
