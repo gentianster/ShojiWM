@@ -1509,6 +1509,7 @@ pub fn init_winit(
                         submit_started_at.elapsed().as_secs_f64() * 1000.0;
 
                     state.space.refresh();
+                    state.publish_xwayland_positions();
                     state.cleanup_popups_with_debug("winit-post-render");
                     state.pending_decoration_damage.clear();
                     state.clear_source_damage();

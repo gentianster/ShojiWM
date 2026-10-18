@@ -753,9 +753,11 @@ impl CompositorHandler for ShojiWM {
         {
             self.schedule_redraw();
         }
+        self.publish_xwayland_positions();
     }
 
-    fn destroyed(&mut self, _surface: &WlSurface) {
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.invalidate_xwayland_surface_position(surface);
         self.refresh_idle_inhibit_state();
     }
 

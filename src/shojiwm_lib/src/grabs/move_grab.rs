@@ -124,6 +124,7 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
         event: &MotionEvent,
     ) {
         // While the grab is active, no client has pointer focus
+        data.publish_xwayland_positions();
         handle.motion(data, None, event);
         self.last_pointer = event.location;
 
@@ -226,6 +227,7 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
         focus: Option<(WlSurface, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
+        data.publish_xwayland_positions();
         handle.relative_motion(data, focus, event);
     }
 
@@ -235,6 +237,7 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
         handle: &mut PointerInnerHandle<'_, ShojiWM>,
         event: &ButtonEvent,
     ) {
+        data.publish_xwayland_positions();
         handle.button(data, event);
 
         // The button is a button code as defined in the
@@ -257,10 +260,12 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
         handle: &mut PointerInnerHandle<'_, ShojiWM>,
         details: AxisFrame,
     ) {
+        data.publish_xwayland_positions();
         handle.axis(data, details)
     }
 
     fn frame(&mut self, data: &mut ShojiWM, handle: &mut PointerInnerHandle<'_, ShojiWM>) {
+        data.publish_xwayland_positions();
         handle.frame(data);
     }
 

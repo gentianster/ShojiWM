@@ -72,6 +72,7 @@ pub mod window_decoration;
 pub mod wlr_foreign_toplevel;
 pub mod workspace_manager;
 pub mod xwayland_satellite;
+pub mod xwayland_position;
 
 // Owned by the library rather than each binary: every ShojiWM build wants the
 // same allocator, and the frame-time budget was measured with this one.

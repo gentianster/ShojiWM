@@ -429,6 +429,7 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
             ran_pre_render_maintenance = true;
             let window_count_before_refresh = state.space.elements().count();
             state.space.refresh();
+            state.publish_xwayland_positions();
             let window_count_after_refresh = state.space.elements().count();
             if window_count_after_refresh != window_count_before_refresh {
                 state.schedule_redraw();

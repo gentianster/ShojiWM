@@ -148,7 +148,61 @@ impl SeatHandler for ShojiWM {
     }
 }
 
-smithay::delegate_dispatch2!(ShojiWM);
+// Keep Smithay's Dispatch2 delegation, with one pre-dispatch barrier for
+// protocol-generated input which bypasses process_input_event (OSK and IME).
+impl<I, UserData> smithay::reexports::wayland_server::Dispatch<I, UserData> for ShojiWM
+where
+    I: Resource,
+    UserData: smithay::wayland::Dispatch2<I, ShojiWM>,
+{
+    fn request(
+        state: &mut Self,
+        client: &smithay::reexports::wayland_server::Client,
+        resource: &I,
+        request: I::Request,
+        data: &UserData,
+        display: &smithay::reexports::wayland_server::DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        if matches!(
+            I::interface().name,
+            "zwp_virtual_keyboard_v1" | "zwp_input_method_v2"
+        ) {
+            state.publish_xwayland_positions();
+        }
+        data.request(state, client, resource, request, display, data_init);
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: smithay::reexports::wayland_server::backend::ClientId,
+        resource: &I,
+        data: &UserData,
+    ) {
+        data.destroyed(state, client, resource);
+    }
+}
+
+impl<I, UserData> smithay::reexports::wayland_server::GlobalDispatch<I, UserData> for ShojiWM
+where
+    I: Resource,
+    UserData: smithay::wayland::GlobalDispatch2<I, ShojiWM>,
+{
+    fn bind(
+        state: &mut Self,
+        display: &smithay::reexports::wayland_server::DisplayHandle,
+        client: &smithay::reexports::wayland_server::Client,
+        resource: smithay::reexports::wayland_server::New<I>,
+        data: &UserData,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        data.bind(state, display, client, resource, data_init);
+    }
+
+    fn can_view(client: smithay::reexports::wayland_server::Client, data: &UserData) -> bool {
+        data.can_view(&client)
+    }
+}
 
 impl PointerConstraintsHandler for ShojiWM {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
@@ -253,6 +307,7 @@ impl SessionLockHandler for ShojiWM {
         self.session_lock_focus_owner = self.window_keyboard_focus_owner.take();
         self.window_keyboard_focus = None;
         if let Some(keyboard) = self.seat.get_keyboard() {
+            self.publish_xwayland_positions();
             keyboard.set_focus(
                 self,
                 Option::<WlSurface>::None,
@@ -268,6 +323,7 @@ impl SessionLockHandler for ShojiWM {
         self.session_lock_surfaces.clear();
         self.pointer_contents = crate::state::PointerContents::default();
         if let Some(keyboard) = self.seat.get_keyboard() {
+            self.publish_xwayland_positions();
             keyboard.set_focus(
                 self,
                 Option::<WlSurface>::None,

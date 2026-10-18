@@ -291,6 +291,7 @@ impl ShojiWM {
             Event::time_msec(event),
             |data, modifiers, _handle| {
                 data.current_keyboard_modifiers = *modifiers;
+                data.publish_xwayland_positions();
                 FilterResult::<KeyboardAction>::Forward
             },
         );
@@ -305,6 +306,7 @@ impl ShojiWM {
     ) {
         let pointer = self.seat.get_pointer().unwrap();
         self.pointer_contents = self.pointer_contents_at(pos);
+        self.publish_xwayland_positions();
         pointer.motion(
             self,
             self.pointer_contents.surface.clone(),
@@ -314,6 +316,7 @@ impl ShojiWM {
                 time,
             },
         );
+        self.publish_xwayland_positions();
         pointer.frame(self);
         self.schedule_redraw();
     }
@@ -327,6 +330,7 @@ impl ShojiWM {
     ) {
         let pointer = self.seat.get_pointer().unwrap();
         self.pointer_contents = self.pointer_contents_at(pointer.current_location());
+        self.publish_xwayland_positions();
         pointer.motion(
             self,
             self.pointer_contents.surface.clone(),
@@ -336,6 +340,7 @@ impl ShojiWM {
                 time,
             },
         );
+        self.publish_xwayland_positions();
         pointer.button(
             self,
             &ButtonEvent {
@@ -345,6 +350,7 @@ impl ShojiWM {
                 time,
             },
         );
+        self.publish_xwayland_positions();
         pointer.frame(self);
         self.focus_session_lock_surface(serial);
         let _ = self.display_handle.flush_clients();
@@ -628,6 +634,7 @@ impl ShojiWM {
         let serial = SERIAL_COUNTER.next_serial();
         if self.runtime_input_grab.is_some() {
             // The grab owns the pointer: move the cursor, focus nothing.
+            self.publish_xwayland_positions();
             pointer.motion(
                 self,
                 None,
@@ -637,6 +644,7 @@ impl ShojiWM {
                     time,
                 },
             );
+            self.publish_xwayland_positions();
             pointer.frame(self);
             self.request_redraw_for_pointer_motion();
             return;
@@ -644,6 +652,7 @@ impl ShojiWM {
 
         self.pointer_contents = self.pointer_contents_at(pos);
         let under = self.pointer_contents.surface.clone();
+        self.publish_xwayland_positions();
         pointer.motion(
             self,
             under,
@@ -653,6 +662,7 @@ impl ShojiWM {
                 time,
             },
         );
+        self.publish_xwayland_positions();
         pointer.frame(self);
         self.activate_pointer_constraint_at(pos);
         self.update_pointer_regions(pos, Point::default(), time);
@@ -750,6 +760,7 @@ impl ShojiWM {
         let pointer = self.seat.get_pointer().unwrap();
         let location = pointer.current_location();
         self.pointer_contents = Default::default();
+        self.publish_xwayland_positions();
         pointer.motion(
             self,
             None,
@@ -759,6 +770,7 @@ impl ShojiWM {
                 time: self.input_grab_now_ms() as u32,
             },
         );
+        self.publish_xwayland_positions();
         pointer.frame(self);
         // A point off every output: decoration hover handlers see a leave.
         self.update_decoration_hover_target(Point::from((-1.0e9, -1.0e9)));
@@ -828,6 +840,7 @@ impl ShojiWM {
         time_msec: u32,
     ) {
         let pointer = self.seat.get_pointer().unwrap();
+        self.publish_xwayland_positions();
         pointer.motion(
             self,
             None,
@@ -837,6 +850,7 @@ impl ShojiWM {
                 time: time_msec,
             },
         );
+        self.publish_xwayland_positions();
         pointer.frame(self);
         let (position, output_name) = self.input_grab_pointer_point();
         self.dispatch_input_grab_event(InputGrabEventSnapshot::PointerMotion {
@@ -923,6 +937,7 @@ impl ShojiWM {
         if Self::input_event_wakes_outputs(&event) {
             self.wake_outputs_on_input();
         }
+        self.publish_xwayland_positions();
 
         match event {
             InputEvent::Keyboard { event, .. } => {
@@ -1066,6 +1081,7 @@ impl ShojiWM {
                                             timestamp: u64::from(time),
                                         });
                                     return if held_release {
+                                        data.publish_xwayland_positions();
                                         FilterResult::Forward
                                     } else {
                                         FilterResult::Intercept(KeyboardAction::Forward)
@@ -1170,6 +1186,7 @@ impl ShojiWM {
                             {
                                 FilterResult::Intercept(KeyboardAction::ChangeVt(vt))
                             } else {
+                                data.publish_xwayland_positions();
                                 FilterResult::Forward
                             }
                         },
@@ -1250,6 +1267,7 @@ impl ShojiWM {
                     }
 
                 if pointer_locked {
+                    self.publish_xwayland_positions();
                     pointer.relative_motion(
                         self,
                         under,
@@ -1259,6 +1277,7 @@ impl ShojiWM {
                             utime: event.time(),
                         },
                     );
+                    self.publish_xwayland_positions();
                     pointer.frame(self);
                     // A locked pointer (e.g. an FPS-style game grabbing the cursor) does not move
                     // the compositor cursor, so it intentionally does not schedule a redraw. Flush
@@ -1311,6 +1330,7 @@ impl ShojiWM {
                         })
                     });
                     if !remains_on_surface || !remains_in_region {
+                        self.publish_xwayland_positions();
                         pointer.relative_motion(
                             self,
                             under,
@@ -1320,6 +1340,7 @@ impl ShojiWM {
                                 utime: event.time(),
                             },
                         );
+                        self.publish_xwayland_positions();
                         pointer.frame(self);
                         // Like a locked pointer, a rejected confined movement has no
                         // compositor-side visual change and therefore no redraw to promptly flush
@@ -1333,6 +1354,8 @@ impl ShojiWM {
                 self.pointer_contents = next_contents;
                 let under = self.pointer_contents.surface.clone();
 
+                self.publish_xwayland_positions();
+
                 pointer.motion(
                     self,
                     under.clone(),
@@ -1345,6 +1368,7 @@ impl ShojiWM {
                 // While app locks are ignored the user is moving the cursor,
                 // not aiming: a game under it must not turn its camera too.
                 if !self.app_lock_ignored {
+                    self.publish_xwayland_positions();
                     pointer.relative_motion(
                         self,
                         under,
@@ -1355,6 +1379,7 @@ impl ShojiWM {
                         },
                     );
                 }
+                self.publish_xwayland_positions();
                 pointer.frame(self);
                 self.activate_pointer_constraint_at(pos);
 
@@ -1407,6 +1432,8 @@ impl ShojiWM {
                 self.pointer_contents = self.pointer_contents_at(pos);
                 let under = self.pointer_contents.surface.clone();
 
+                self.publish_xwayland_positions();
+
                 pointer.motion(
                     self,
                     under,
@@ -1416,6 +1443,7 @@ impl ShojiWM {
                         time: event.time_msec(),
                     },
                 );
+                self.publish_xwayland_positions();
                 pointer.frame(self);
                 self.activate_pointer_constraint_at(pos);
                 self.dispatch_pointer_move_events(previous_pos, pos, event.time_msec());
@@ -1485,6 +1513,7 @@ impl ShojiWM {
                 // testing before a button event can briefly change that focus while the client
                 // updates its surface tree, deactivating the lock and leaking one absolute move.
                 if self.active_pointer_lock_focus(&pointer).is_some() {
+                    self.publish_xwayland_positions();
                     pointer.button(
                         self,
                         &ButtonEvent {
@@ -1494,6 +1523,7 @@ impl ShojiWM {
                             time: event.time_msec(),
                         },
                     );
+                    self.publish_xwayland_positions();
                     pointer.frame(self);
                     // The locked client will commit its visual response itself. Avoid submitting
                     // an unchanged fullscreen frame before that commit.
@@ -1567,6 +1597,7 @@ impl ShojiWM {
                             "pointer target before button dispatch"
                         );
                     }
+                    self.publish_xwayland_positions();
                     pointer.motion(
                         self,
                         under,
@@ -1576,6 +1607,7 @@ impl ShojiWM {
                             time: event.time_msec(),
                         },
                     );
+                    self.publish_xwayland_positions();
                     pointer.frame(self);
 
                     if layer_focus_debug_enabled() {
@@ -1680,6 +1712,8 @@ impl ShojiWM {
                             );
                         }
 
+                        self.publish_xwayland_positions();
+
                         pointer.frame(self);
                         let _ = self.display_handle.flush_clients();
                         self.schedule_redraw();
@@ -1761,6 +1795,8 @@ impl ShojiWM {
                                 );
                             }
 
+                            self.publish_xwayland_positions();
+
                             pointer.frame(self);
                             let _ = self.display_handle.flush_clients();
                             self.schedule_redraw();
@@ -1788,6 +1824,7 @@ impl ShojiWM {
 
                         match hit {
                             DecorationHitTestResult::Action(WindowAction::Close) => {
+                                self.publish_xwayland_positions();
                                 pointer.button(
                                     self,
                                     &ButtonEvent {
@@ -1812,6 +1849,7 @@ impl ShojiWM {
                                 }
                             }
                             DecorationHitTestResult::Action(WindowAction::Maximize) => {
+                                self.publish_xwayland_positions();
                                 pointer.button(
                                     self,
                                     &ButtonEvent {
@@ -1828,6 +1866,7 @@ impl ShojiWM {
                                 );
                             }
                             DecorationHitTestResult::Action(WindowAction::Unmaximize) => {
+                                self.publish_xwayland_positions();
                                 pointer.button(
                                     self,
                                     &ButtonEvent {
@@ -1844,6 +1883,7 @@ impl ShojiWM {
                                 );
                             }
                             DecorationHitTestResult::Action(WindowAction::Minimize) => {
+                                self.publish_xwayland_positions();
                                 pointer.button(
                                     self,
                                     &ButtonEvent {
@@ -1862,6 +1902,7 @@ impl ShojiWM {
                             DecorationHitTestResult::Action(WindowAction::RuntimeHandler(
                                 handler_id,
                             )) => {
+                                self.publish_xwayland_positions();
                                 pointer.button(
                                     self,
                                     &ButtonEvent {
@@ -1973,6 +2014,7 @@ impl ShojiWM {
                                 }
                             }
                             DecorationHitTestResult::ClientArea => {
+                                self.publish_xwayland_positions();
                                 pointer.button(
                                     self,
                                     &ButtonEvent {
@@ -1986,6 +2028,8 @@ impl ShojiWM {
                             DecorationHitTestResult::Outside => {}
                             DecorationHitTestResult::Popup => {}
                         }
+
+                        self.publish_xwayland_positions();
 
                         pointer.frame(self);
                         let _ = self.display_handle.flush_clients();
@@ -2050,6 +2094,8 @@ impl ShojiWM {
                     }
                 };
 
+                self.publish_xwayland_positions();
+
                 pointer.button(
                     self,
                     &ButtonEvent {
@@ -2059,6 +2105,7 @@ impl ShojiWM {
                         time: event.time_msec(),
                     },
                 );
+                self.publish_xwayland_positions();
                 pointer.frame(self);
                 let _ = self.display_handle.flush_clients();
                 // Ensure the next redraw runs so frame callbacks flow to the clients that just
@@ -2130,7 +2177,9 @@ impl ShojiWM {
 
                 let pointer = self.seat.get_pointer().unwrap();
                 if self.session_lock_active {
+                    self.publish_xwayland_positions();
                     pointer.axis(self, frame);
+                    self.publish_xwayland_positions();
                     pointer.frame(self);
                     let _ = self.display_handle.flush_clients();
                     return;
@@ -2198,7 +2247,9 @@ impl ShojiWM {
                         return;
                     }
                 }
+                self.publish_xwayland_positions();
                 pointer.axis(self, frame);
+                self.publish_xwayland_positions();
                 pointer.frame(self);
             }
             InputEvent::GestureSwipeBegin { event, .. } => {
@@ -3518,6 +3569,7 @@ impl ShojiWM {
         let stale = pointer.current_focus().as_ref() != desired_focus;
         if changed || stale {
             let under = self.pointer_contents.surface.clone();
+            self.publish_xwayland_positions();
             pointer.motion(
                 self,
                 under,
@@ -3527,6 +3579,7 @@ impl ShojiWM {
                     time: time_msec,
                 },
             );
+            self.publish_xwayland_positions();
             pointer.frame(self);
         }
         self.update_decoration_hover_target(location);

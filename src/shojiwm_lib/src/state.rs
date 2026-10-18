@@ -275,6 +275,7 @@ pub struct ShojiWM {
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub xwayland_position_state: crate::xwayland_position::XwaylandPositionState,
     pub layer_shell_state: WlrLayerShellState,
     pub xdg_activation_state: XdgActivationState,
     pub xdg_decoration_state: XdgDecorationState,
@@ -763,6 +764,7 @@ impl ShojiWM {
         ));
         self.pointer_contents = self.pointer_contents_at(location);
         let under = self.pointer_contents.surface.clone();
+        self.publish_xwayland_positions();
         pointer.motion(
             self,
             under,
@@ -772,6 +774,7 @@ impl ShojiWM {
                 time: Duration::from(self.clock.now()).as_millis() as u32,
             },
         );
+        self.publish_xwayland_positions();
         pointer.frame(self);
     }
 
@@ -968,6 +971,7 @@ impl ShojiWM {
 
         if let Some(keyboard) = self.seat.get_keyboard()
             && keyboard.current_focus().as_ref() != focus.as_ref() {
+                self.publish_xwayland_positions();
                 keyboard.set_focus(self, focus, serial);
             }
     }
@@ -1483,6 +1487,7 @@ impl ShojiWM {
             if self.should_defer_initial_keyboard_focus(desired_focus.as_ref()) {
                 self.schedule_redraw();
             } else {
+                self.publish_xwayland_positions();
                 self.seat
                     .get_keyboard()
                     .unwrap()
@@ -1518,11 +1523,14 @@ impl ShojiWM {
             return;
         };
 
+        self.publish_xwayland_positions();
+
         keyboard.set_focus(
             self,
             Option::<WlSurface>::None,
             SERIAL_COUNTER.next_serial(),
         );
+        self.publish_xwayland_positions();
         keyboard.set_focus(self, Some(focus), SERIAL_COUNTER.next_serial());
     }
 
@@ -1550,6 +1558,7 @@ impl ShojiWM {
         // Initialize protocols needed for displaying windows
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let xwayland_position_state = crate::xwayland_position::XwaylandPositionState::new(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
@@ -1731,6 +1740,7 @@ impl ShojiWM {
 
             compositor_state,
             xdg_shell_state,
+            xwayland_position_state,
             layer_shell_state,
             xdg_activation_state,
             xdg_decoration_state,
@@ -2244,6 +2254,7 @@ impl ShojiWM {
             Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
                 xwayland_refresh_override: true,
+                xwayland_position_allowed: true,
                 identity,
             }),
         ) {
@@ -2484,6 +2495,7 @@ impl ShojiWM {
                     Arc::new(ClientState {
                         compositor_state: CompositorClientState::default(),
                         xwayland_refresh_override: client_is_xwayland_bridge,
+                        xwayland_position_allowed: false,
                         identity: client_identity,
                     }),
                 ) {
@@ -5697,6 +5709,8 @@ impl ShojiWM {
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
     pub xwayland_refresh_override: bool,
+    /// Only the connection inserted by the embedded bridge receives positions.
+    pub(crate) xwayland_position_allowed: bool,
     identity: WaylandClientIdentity,
 }
 
