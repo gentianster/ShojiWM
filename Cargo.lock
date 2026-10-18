@@ -3307,7 +3307,7 @@ checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 [[package]]
 name = "macros"
 version = "0.1.0"
-source = "git+https://github.com/gentianster/xwayland-satellite.git?rev=6468c6ffa0ee78a5940fc6d2e9b78741d50ce7e8#6468c6ffa0ee78a5940fc6d2e9b78741d50ce7e8"
+source = "git+https://github.com/gentianster/xwayland-satellite.git?rev=238224571d34a1b5e5cab9709ee7a94afc43e2c5#238224571d34a1b5e5cab9709ee7a94afc43e2c5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8214,7 +8214,7 @@ dependencies = [
 [[package]]
 name = "wl_drm"
 version = "0.1.0"
-source = "git+https://github.com/gentianster/xwayland-satellite.git?rev=6468c6ffa0ee78a5940fc6d2e9b78741d50ce7e8#6468c6ffa0ee78a5940fc6d2e9b78741d50ce7e8"
+source = "git+https://github.com/gentianster/xwayland-satellite.git?rev=238224571d34a1b5e5cab9709ee7a94afc43e2c5#238224571d34a1b5e5cab9709ee7a94afc43e2c5"
 dependencies = [
  "wayland-client",
  "wayland-scanner",
@@ -8381,7 +8381,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 [[package]]
 name = "xwayland-satellite"
 version = "0.8.2"
-source = "git+https://github.com/gentianster/xwayland-satellite.git?rev=6468c6ffa0ee78a5940fc6d2e9b78741d50ce7e8#6468c6ffa0ee78a5940fc6d2e9b78741d50ce7e8"
+source = "git+https://github.com/gentianster/xwayland-satellite.git?rev=238224571d34a1b5e5cab9709ee7a94afc43e2c5#238224571d34a1b5e5cab9709ee7a94afc43e2c5"
 dependencies = [
  "ab_glyph",
  "anyhow",

@@ -11,7 +11,7 @@ smithay = { git = "https://github.com/bea4dev/smithay.git", rev = "ba36cf26cd7cd
 smithay-drm-extras = { git = "https://github.com/bea4dev/smithay.git", rev = "ba36cf26cd7cdf4431319392301c82ea226dfc52", package = "smithay-drm-extras", default-features = false }
 # xwayland-satellite, run in-process on its own thread (see
 # `xwayland_satellite.rs`). Renamed so the crate does not clash with that module.
-satellite = { package = "xwayland-satellite", git = "https://github.com/gentianster/xwayland-satellite.git", rev = "6468c6ffa0ee78a5940fc6d2e9b78741d50ce7e8" }
+satellite = { package = "xwayland-satellite", git = "https://github.com/gentianster/xwayland-satellite.git", rev = "238224571d34a1b5e5cab9709ee7a94afc43e2c5" }
 wayland-protocols = { version = "0.32.12", features = ["server", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
 # KDE-private protocols that plasmashell needs (taskbar window list, popup
