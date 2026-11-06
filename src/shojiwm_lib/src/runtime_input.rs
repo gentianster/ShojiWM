@@ -510,6 +510,14 @@ fn apply_keyboard_xkb_config(
         Ok(()) => {
             state.runtime_applied_xkb_config = keyboard;
             state.refresh_keyboard_focus_for_keymap_change();
+            // Applying an XKB config rebuilds the keyboard state and
+            // clears locked modifiers; restore Num Lock.
+            let mut mods = handle.modifier_state();
+            if !mods.num_lock {
+                mods.num_lock = true;
+                let _ = handle.set_modifier_state(mods);
+                handle.advertise_modifier_state(state);
+            }
         }
         Err(error) => {
             warn!(?error, "{log_label}: failed to apply");

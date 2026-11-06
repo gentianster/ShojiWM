@@ -1594,7 +1594,13 @@ impl ShojiWM {
 
         // Notify clients that we have a keyboard, for the sake of the example we assume that keyboard is always present.
         // You may want to track keyboard hot-plug in real compositor.
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        let keyboard = seat.add_keyboard(Default::default(), 200, 25).unwrap();
+
+        // Sessions start with Num Lock on.
+        let _ = keyboard.set_modifier_state(ModifiersState {
+            num_lock: true,
+            ..Default::default()
+        });
 
         // Notify clients that we have a pointer (mouse)
         // Here we assume that there is always pointer plugged in
