@@ -1,8 +1,10 @@
 import type {
+  VirtualDesktopConfig,
   WorkspaceActivateEvent,
   WorkspaceConfig,
   WorkspaceConfigureFactory,
   WorkspaceController,
+  WorkspaceMoveWindowEvent,
 } from "./types";
 
 let desiredWorkspaceConfig: WorkspaceConfig = { groups: [] };
@@ -10,9 +12,29 @@ let pendingWorkspaceConfig = false;
 let configureFactory: WorkspaceConfigureFactory | null = null;
 let stagedConfigureFactory: WorkspaceConfigureFactory | null | undefined;
 const activateListeners = new Set<(event: WorkspaceActivateEvent) => void>();
+const moveWindowListeners = new Set<(event: WorkspaceMoveWindowEvent) => void>();
+
+function cloneVirtualDesktops(
+  config: VirtualDesktopConfig | undefined,
+): VirtualDesktopConfig | undefined {
+  if (!config) {
+    return undefined;
+  }
+  return {
+    desktops: config.desktops.map((desktop) => ({
+      id: String(desktop.id),
+      name: String(desktop.name),
+      active: desktop.active === true,
+      windowIds: (desktop.windowIds ?? []).map(String),
+    })),
+    rows: Math.max(1, Math.trunc(config.rows ?? 1)),
+    minimizedWindowIds: (config.minimizedWindowIds ?? []).map(String),
+  };
+}
 
 function cloneWorkspaceConfig(config: WorkspaceConfig): WorkspaceConfig {
   return {
+    virtualDesktops: cloneVirtualDesktops(config.virtualDesktops),
     groups: config.groups.map((group) => ({
       id: group.id,
       outputs: [...group.outputs],
@@ -32,6 +54,7 @@ function cloneWorkspaceConfig(config: WorkspaceConfig): WorkspaceConfig {
 
 function normalizeWorkspaceConfig(config: WorkspaceConfig): WorkspaceConfig {
   return {
+    virtualDesktops: cloneVirtualDesktops(config.virtualDesktops),
     groups: config.groups.map((group) => ({
       id: String(group.id),
       outputs: group.outputs.map(String),
@@ -113,10 +136,31 @@ export function takePendingWorkspaceConfig(): WorkspaceConfig | undefined {
   return cloneWorkspaceConfig(desiredWorkspaceConfig);
 }
 
-export function emitWorkspaceActivate(event: WorkspaceActivateEvent): boolean {
+/**
+ * Deliver a workspace request from a client: with `windowId` it moves that
+ * window (`onMoveWindow`), otherwise it activates the workspace (`onActivate`).
+ */
+export function emitWorkspaceActivate(
+  event: WorkspaceActivateEvent & { windowId?: string },
+): boolean {
   let invoked = false;
+  if (event.windowId !== undefined) {
+    const moveEvent: WorkspaceMoveWindowEvent = {
+      workspaceId: event.workspaceId,
+      windowId: event.windowId,
+    };
+    for (const listener of Array.from(moveWindowListeners)) {
+      listener(moveEvent);
+      invoked = true;
+    }
+    return invoked;
+  }
+  const activateEvent: WorkspaceActivateEvent = {
+    workspaceId: event.workspaceId,
+    groupId: event.groupId,
+  };
   for (const listener of Array.from(activateListeners)) {
-    listener(event);
+    listener(activateEvent);
     invoked = true;
   }
   return invoked;
@@ -133,6 +177,10 @@ export const WORKSPACE_CONTROLLER: WorkspaceController = {
     onActivate(listener) {
       activateListeners.add(listener);
       return () => activateListeners.delete(listener);
+    },
+    onMoveWindow(listener) {
+      moveWindowListeners.add(listener);
+      return () => moveWindowListeners.delete(listener);
     },
   },
 };

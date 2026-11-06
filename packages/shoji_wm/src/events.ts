@@ -1,3 +1,4 @@
+import { hasDndStartListeners, takeDndListenersChanged } from "./dnd";
 import type {
   InputDeviceInfo,
   OutputInfo,
@@ -249,6 +250,28 @@ export interface PointerMoveEvent {
 
 export type PointerMoveListener = (event: PointerMoveEvent) => void;
 
+/**
+ * `enter` / `leave`: the pointer moved into or out of the region.
+ * `pressure`: inside the region, the pointer was pushed `pressure` px against
+ * the edge of the output layout (once per visit).
+ * `enter` / `leave`: ポインターが領域に入った・出た。
+ * `pressure`: 領域内で画面配置の端へ `pressure` px 押し込んだ（滞在中1回）。
+ */
+export type PointerRegionPhase = "enter" | "leave" | "pressure";
+
+export interface PointerRegionEvent {
+  /** The id given to `COMPOSITOR.pointer.defineRegion`. */
+  id: string;
+  phase: PointerRegionPhase;
+  /** The output whose copy of the region the pointer is in (or left). */
+  outputName: string;
+  position: PointerMovePoint;
+  modifiers: PointerModifierState;
+  timestamp: number;
+}
+
+export type PointerRegionListener = (event: PointerRegionEvent) => void;
+
 export type PointerMoveAsyncListener = (
   event: PointerMoveEvent,
 ) => void | Promise<void>;
@@ -281,6 +304,7 @@ export interface RuntimeEventConfig {
   pointerMoveAsync: boolean;
   gestureSwipe: boolean;
   gestureSwipeAsync: boolean;
+  dnd: boolean;
 }
 
 /**
@@ -504,6 +528,26 @@ export interface CompositorEventController {
    */
   onGestureSwipeAsync(listener: GestureSwipeAsyncListener): () => void;
   /**
+   * Fires when the pointer enters, leaves or pushes against a region defined
+   * with `COMPOSITOR.pointer.defineRegion`. The compositor hit-tests regions
+   * itself, so pointer motion elsewhere costs no runtime call.
+   * `COMPOSITOR.pointer.defineRegion` で定義した領域にポインターが入った・出た・
+   * 押し込んだときに発火します。判定はコンポジター側で行うため、領域外での
+   * ポインター移動ではランタイムは呼ばれません。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.pointer.defineRegion("top-strip", {
+   *   anchor: "top",
+   *   size: { width: 400, height: 2 },
+   * });
+   * COMPOSITOR.event.onPointerRegion((event) => {
+   *   if (event.id === "top-strip" && event.phase === "enter") showBar(event.outputName);
+   * });
+   * ```
+   */
+  onPointerRegion(listener: PointerRegionListener): () => void;
+  /**
    * Fires when a new layer-shell surface is created.
    * 新しいレイヤーシェルサーフェスが作成されたときに発火します。
    */
@@ -574,6 +618,8 @@ export interface CompositorEventController {
   /** @internal */
   emitGestureSwipeAsync(event: GestureSwipeEvent): Promise<boolean>;
   /** @internal */
+  emitPointerRegion(event: PointerRegionEvent): boolean;
+  /** @internal */
   emitCreateLayer(layer: WaylandLayer): void;
   /** @internal */
   emitUpdateLayer(layer: WaylandLayer): void;
@@ -613,6 +659,7 @@ export function createCompositorEventController(): CompositorEventController {
   const pointerMoveAsyncListeners = new Set<PointerMoveAsyncListener>();
   const gestureSwipeListeners = new Set<GestureSwipeListener>();
   const gestureSwipeAsyncListeners = new Set<GestureSwipeAsyncListener>();
+  const pointerRegionListeners = new Set<PointerRegionListener>();
   const createLayerListeners = new Set<LayerCreateListener>();
   const updateLayerListeners = new Set<LayerUpdateListener>();
   const destroyLayerListeners = new Set<LayerDestroyListener>();
@@ -721,6 +768,12 @@ export function createCompositorEventController(): CompositorEventController {
       return () => {
         gestureSwipeAsyncListeners.delete(listener);
         markEventConfigDirty();
+      };
+    },
+    onPointerRegion(listener) {
+      pointerRegionListeners.add(listener);
+      return () => {
+        pointerRegionListeners.delete(listener);
       };
     },
     onCreateLayer(listener) {
@@ -870,6 +923,15 @@ export function createCompositorEventController(): CompositorEventController {
       }
       return true;
     },
+    emitPointerRegion(event) {
+      if (pointerRegionListeners.size === 0) {
+        return false;
+      }
+      for (const listener of pointerRegionListeners) {
+        listener(event);
+      }
+      return true;
+    },
     emitCreateLayer(layer) {
       for (const listener of createLayerListeners) {
         listener(layer);
@@ -919,7 +981,8 @@ export function createCompositorEventController(): CompositorEventController {
       return next;
     },
     takePendingEventConfig() {
-      if (!pendingEventConfig) {
+      const dndChanged = takeDndListenersChanged();
+      if (!pendingEventConfig && !dndChanged) {
         return undefined;
       }
       pendingEventConfig = false;
@@ -928,6 +991,7 @@ export function createCompositorEventController(): CompositorEventController {
         pointerMoveAsync: pointerMoveAsyncListeners.size > 0,
         gestureSwipe: gestureSwipeListeners.size > 0,
         gestureSwipeAsync: gestureSwipeAsyncListeners.size > 0,
+        dnd: hasDndStartListeners(),
       };
     },
   };

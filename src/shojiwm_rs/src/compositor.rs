@@ -34,7 +34,10 @@ use shojiwm_lib::{
         RuntimeProcessAction, RuntimeProcessEntry, RuntimeProcessLaunch,
         RuntimeProcessReloadPolicy, RuntimeProcessRestartPolicy, RuntimeProcessRunPolicy,
     },
-    runtime_workspace::{RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate},
+    runtime_workspace::{
+        RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate,
+        RuntimeWorkspaceMoveWindowEvent,
+    },
     ssd::{
         GestureSwipeEventSnapshot,
         window_model::{LayerEdgeSnapshot, LayerExclusiveZoneSnapshot},
@@ -48,6 +51,14 @@ use shojiwm_lib::{
 };
 
 pub use shojiwm_lib::frame_pacing::FramePacing;
+pub use shojiwm_lib::cursor::{
+    CursorPositionSnapshot, RuntimeCursorPositionTarget as CursorPosition,
+};
+pub use shojiwm_lib::runtime_pointer_region::{
+    PointerRegionAnchor, PointerRegionEventSnapshot, PointerRegionOffset, PointerRegionPhase,
+    PointerRegionSize,
+};
+use shojiwm_lib::runtime_pointer_region::PointerRegionSpec;
 
 use crate::{
     effect::{Effect, SurfaceEffects},
@@ -76,6 +87,7 @@ pub struct Compositor {
     pub rendering: RenderingController,
     pub event: EventController,
     pub debug: DebugController,
+    pub dnd: crate::dnd::DndController,
 }
 
 /// The one compositor. Use it like the TypeScript global.
@@ -94,6 +106,7 @@ pub const COMPOSITOR: Compositor = Compositor {
     rendering: RenderingController,
     event: EventController,
     debug: DebugController,
+    dnd: crate::dnd::DndController,
 };
 
 /// Passed to [`Compositor::on_enable`] listeners.
@@ -239,6 +252,68 @@ impl CursorController {
             });
         });
     }
+
+    /// Move the cursor. Ignored while a client holds the pointer locked or
+    /// confined, while a button is held, and while the session is locked.
+    ///
+    /// ```no_run
+    /// use shojiwm_rs::prelude::*;
+    ///
+    /// COMPOSITOR.cursor.set_position(CursorPosition::Global { x: 800.0, y: 500.0 });
+    /// COMPOSITOR.cursor.set_position(CursorPosition::Output {
+    ///     output: "DP-1".into(),
+    ///     anchor: PointerRegionAnchor::Center,
+    ///     offset: Default::default(),
+    /// });
+    /// ```
+    pub fn set_position(&self, position: CursorPosition) {
+        runtime::send(HostMessage::CursorPosition(position));
+    }
+
+    /// Where the cursor is, as of the last pointer motion.
+    pub fn get_position(&self) -> Option<CursorPositionSnapshot> {
+        runtime::host().and_then(|host| host.cursor_position())
+    }
+
+    /// Ignore client pointer locks and confinements (a game holding the
+    /// cursor) while `ignored`.
+    pub fn set_app_lock_ignored(&self, ignored: bool) {
+        with_registry(|registry| {
+            registry.app_lock_ignored = ignored;
+            registry.pending.pointer = true;
+        });
+    }
+
+    /// Show the cursor named `kind` (a CSS `cursor` value such as
+    /// `"no-drop"` or `"grabbing"`) everywhere, whatever the window under
+    /// the pointer asks for, until called again; `"none"` hides the cursor
+    /// and `None` gives it back to the windows. Wins over the resize cursors
+    /// of window borders too. Not shown in a nested (windowed) session,
+    /// where the host draws the cursor.
+    ///
+    /// ```no_run
+    /// use shojiwm_rs::prelude::*;
+    ///
+    /// COMPOSITOR.dnd.on_start(|drag| {
+    ///     effect(move || {
+    ///         let refused = drag.action().get() == DragAction::None && drag.target().get().is_some();
+    ///         let _ = COMPOSITOR.cursor.override_kind(refused.then_some("no-drop"));
+    ///     });
+    /// });
+    /// ```
+    pub fn override_kind(&self, kind: Option<&str>) -> Result<(), String> {
+        let kind = kind.map(shojiwm_lib::cursor::CursorOverride::parse).transpose()?;
+        runtime::send(HostMessage::CursorOverride(kind));
+        Ok(())
+    }
+
+    /// Ignore client pointer locks while `modifier` (e.g. `"Super"`) is held.
+    pub fn bind_app_lock_ignore_modifier(&self, modifier: &str) {
+        with_registry(|registry| {
+            registry.app_lock_ignore_modifier = Some(modifier.to_owned());
+            registry.pending.pointer = true;
+        });
+    }
 }
 
 /// How to start a process.
@@ -359,19 +434,48 @@ impl KeyController {
         phase: RuntimeKeyBindingPhase,
         handler: impl Fn() + 'static,
     ) {
-        let entry = RuntimeKeyBindingEntry {
-            id: id.to_owned(),
-            shortcut: shortcut.to_owned(),
-            on: phase,
-        };
+        self.bind_entry(
+            RuntimeKeyBindingEntry {
+                id: id.to_owned(),
+                shortcut: shortcut.to_owned(),
+                on: phase,
+                within: None,
+            },
+            handler,
+        );
+    }
+
+    /// A modifier tap (e.g. `"Super"`) that fires only when released within
+    /// `within_ms` of being pressed, so holding the modifier for a while (a
+    /// drag, a combination never completed) does not trigger it.
+    pub fn bind_tap(
+        &self,
+        id: &str,
+        modifier: &str,
+        within_ms: u32,
+        handler: impl Fn() + 'static,
+    ) {
+        self.bind_entry(
+            RuntimeKeyBindingEntry {
+                id: id.to_owned(),
+                shortcut: modifier.to_owned(),
+                on: RuntimeKeyBindingPhase::Release,
+                within: Some(within_ms),
+            },
+            handler,
+        );
+    }
+
+    fn bind_entry(&self, entry: RuntimeKeyBindingEntry, handler: impl Fn() + 'static) {
+        let id = entry.id.clone();
         if let Err(error) = entry.compile() {
-            tracing::warn!(id, shortcut, %error, "ignoring invalid key binding");
+            tracing::warn!(id, shortcut = entry.shortcut, %error, "ignoring invalid key binding");
             return;
         }
         with_registry(|registry| {
             registry.key_bindings.retain(|existing| existing.id != id);
             registry.key_bindings.push(entry);
-            registry.key_handlers.insert(id.to_owned(), Rc::new(handler));
+            registry.key_handlers.insert(id, Rc::new(handler));
             registry.pending.key_bindings = true;
         });
     }
@@ -403,6 +507,223 @@ impl PointerController {
             registry.window_resize_modifier = Some(modifier.to_owned());
             registry.pending.pointer = true;
         });
+    }
+
+    /// Define (or replace) the pointer region `id`. The compositor hit-tests
+    /// it on every pointer motion and reports only transitions, through
+    /// [`EventController::on_pointer_region`].
+    ///
+    /// ```no_run
+    /// use shojiwm_rs::prelude::*;
+    ///
+    /// COMPOSITOR.pointer.define_region("top-strip", PointerRegion {
+    ///     anchor: PointerRegionAnchor::Top,
+    ///     size: PointerRegionSize { width: 400.0, height: 2.0 },
+    ///     ..Default::default()
+    /// });
+    /// COMPOSITOR.event.on_pointer_region(|event| {
+    ///     if event.id == "top-strip" && event.phase == PointerRegionPhase::Enter {
+    ///         tracing::info!(output = event.output_name, "top strip entered");
+    ///     }
+    /// });
+    /// ```
+    pub fn define_region(&self, id: &str, region: PointerRegion) {
+        let spec = region.into_spec(id);
+        with_registry(|registry| {
+            registry.pointer_regions.retain(|existing| existing.id != id);
+            registry.pointer_regions.push(spec);
+            registry.pending.pointer = true;
+        });
+    }
+
+    pub fn remove_region(&self, id: &str) {
+        with_registry(|registry| {
+            registry.pointer_regions.retain(|existing| existing.id != id);
+            registry.region_handlers.remove(id);
+            registry.pending.pointer = true;
+        });
+    }
+
+    /// A hot corner: `handler` runs when the pointer reaches `corner` (after
+    /// `delay_ms` there, or once pushed `pressure` px into it). Built on
+    /// [`Self::define_region`] with the region id `hot-corner:{id}`.
+    ///
+    /// ```no_run
+    /// use shojiwm_rs::prelude::*;
+    ///
+    /// COMPOSITOR.pointer.bind_hot_corner(
+    ///     "overview",
+    ///     HotCorner::TopLeft,
+    ///     |_event| tracing::info!("open the overview"),
+    ///     HotCornerOptions::default(),
+    /// );
+    /// ```
+    pub fn bind_hot_corner(
+        &self,
+        id: &str,
+        corner: HotCorner,
+        handler: impl Fn(&PointerRegionEventSnapshot) + 'static,
+        options: HotCornerOptions,
+    ) {
+        let region_id = format!("hot-corner:{id}");
+        self.define_region(
+            &region_id,
+            PointerRegion {
+                output: options.output,
+                anchor: corner.anchor(),
+                size: PointerRegionSize {
+                    width: options.size,
+                    height: options.size,
+                },
+                outer_edges_only: true,
+                leave_margin: options.leave_margin,
+                pressure: options.pressure,
+                ignore_when_fullscreen: options.ignore_when_fullscreen,
+                ignore_while_button_held: options.ignore_while_button_held,
+                ..Default::default()
+            },
+        );
+        let trigger = if options.pressure.is_some() {
+            PointerRegionPhase::Pressure
+        } else {
+            PointerRegionPhase::Enter
+        };
+        let delay_ms = options.delay_ms;
+        let pending: Rc<std::cell::Cell<Option<crate::animation::TimerHandle>>> = Rc::default();
+        let handler = Rc::new(handler);
+        let region_handler = move |event: &PointerRegionEventSnapshot| {
+            if event.phase == PointerRegionPhase::Leave {
+                if let Some(timer) = pending.take() {
+                    timer.cancel();
+                }
+                return;
+            }
+            if event.phase != trigger {
+                return;
+            }
+            if trigger == PointerRegionPhase::Pressure || delay_ms <= 0.0 {
+                handler(event);
+                return;
+            }
+            let handler = handler.clone();
+            let event = event.clone();
+            let fired = pending.clone();
+            if let Some(timer) = pending.take() {
+                timer.cancel();
+            }
+            pending.set(Some(crate::animation::set_timeout(delay_ms, move || {
+                fired.set(None);
+                handler(&event);
+            })));
+        };
+        with_registry(|registry| {
+            registry
+                .region_handlers
+                .insert(region_id, Rc::new(region_handler));
+        });
+    }
+}
+
+/// Passed to [`PointerController::define_region`]. The region is placed on
+/// each output (or only `output`) by `anchor`, then moved by `offset`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointerRegion {
+    pub output: Option<String>,
+    pub anchor: PointerRegionAnchor,
+    pub offset: PointerRegionOffset,
+    pub size: PointerRegionSize,
+    /// Skip outputs where the region touches an edge another output continues.
+    pub outer_edges_only: bool,
+    /// Once inside, the region grows by this much before the pointer leaves.
+    pub leave_margin: f64,
+    /// Report [`PointerRegionPhase::Pressure`] after this much push (logical
+    /// px) against the edge of the output layout.
+    pub pressure: Option<f64>,
+    pub ignore_when_fullscreen: bool,
+    pub ignore_while_button_held: bool,
+}
+
+impl Default for PointerRegion {
+    fn default() -> Self {
+        Self {
+            output: None,
+            anchor: PointerRegionAnchor::TopLeft,
+            offset: PointerRegionOffset::default(),
+            size: PointerRegionSize {
+                width: 1.0,
+                height: 1.0,
+            },
+            outer_edges_only: false,
+            leave_margin: 0.0,
+            pressure: None,
+            ignore_when_fullscreen: false,
+            ignore_while_button_held: false,
+        }
+    }
+}
+
+impl PointerRegion {
+    fn into_spec(self, id: &str) -> PointerRegionSpec {
+        PointerRegionSpec {
+            id: id.to_owned(),
+            output: self.output,
+            anchor: self.anchor,
+            offset: self.offset,
+            size: self.size,
+            outer_edges_only: self.outer_edges_only,
+            leave_margin: self.leave_margin,
+            pressure: self.pressure,
+            ignore_when_fullscreen: self.ignore_when_fullscreen,
+            ignore_while_button_held: self.ignore_while_button_held,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl HotCorner {
+    fn anchor(self) -> PointerRegionAnchor {
+        match self {
+            Self::TopLeft => PointerRegionAnchor::TopLeft,
+            Self::TopRight => PointerRegionAnchor::TopRight,
+            Self::BottomLeft => PointerRegionAnchor::BottomLeft,
+            Self::BottomRight => PointerRegionAnchor::BottomRight,
+        }
+    }
+}
+
+/// Passed to [`PointerController::bind_hot_corner`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotCornerOptions {
+    pub output: Option<String>,
+    /// Side of the square corner region, logical px.
+    pub size: f64,
+    /// Stay this long in the corner before the handler runs.
+    pub delay_ms: f64,
+    /// Run on this much push into the corner instead of on entering it.
+    pub pressure: Option<f64>,
+    pub leave_margin: f64,
+    pub ignore_when_fullscreen: bool,
+    pub ignore_while_button_held: bool,
+}
+
+impl Default for HotCornerOptions {
+    fn default() -> Self {
+        Self {
+            output: None,
+            size: 1.0,
+            delay_ms: 0.0,
+            pressure: None,
+            leave_margin: 8.0,
+            ignore_when_fullscreen: true,
+            ignore_while_button_held: true,
+        }
     }
 }
 
@@ -657,6 +978,12 @@ impl WorkspaceController {
     pub fn on_activate(&self, listener: impl Fn(&RuntimeWorkspaceActivateRequestSnapshot) + 'static) {
         with_registry(|registry| registry.listeners.workspace_activate.push(Rc::new(listener)));
     }
+
+    /// A client (KDE's Pager or taskbar) asked to move a window to a
+    /// workspace. The workspace ids are the `virtual_desktops` ids.
+    pub fn on_move_window(&self, listener: impl Fn(&RuntimeWorkspaceMoveWindowEvent) + 'static) {
+        with_registry(|registry| registry.listeners.workspace_move_window.push(Rc::new(listener)));
+    }
 }
 
 /// `COMPOSITOR.layer`: layer-shell surfaces (bars, wallpapers, ...).
@@ -901,6 +1228,9 @@ listeners! {
     on_create_layer => create_layer: &WaylandLayerSnapshot;
     on_update_layer => update_layer: &WaylandLayerSnapshot;
     on_destroy_layer => destroy_layer: &WaylandLayerSnapshot;
+    /// The pointer entered, left or pushed against a region from
+    /// [`PointerController::define_region`].
+    on_pointer_region => pointer_region: &PointerRegionEventSnapshot;
 }
 
 impl EventController {

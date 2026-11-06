@@ -323,6 +323,9 @@ struct EmbeddedRunData {
 }
 
 impl satellite::RunData for EmbeddedRunData {
+    fn scaling_config(&self) -> satellite::ScalingConfig {
+        satellite::ScalingConfig::from_env()
+    }
     fn display(&self) -> Option<&str> {
         Some(&self.display)
     }

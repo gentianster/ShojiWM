@@ -172,6 +172,9 @@ enum RuntimeRequest<'a> {
         #[serde(rename = "groupId")]
         #[serde(skip_serializing_if = "Option::is_none")]
         group_id: Option<&'a str>,
+        #[serde(rename = "windowId")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        window_id: Option<&'a str>,
         #[serde(rename = "nowMs")]
         now_ms: u64,
         #[serde(rename = "displayState")]
@@ -1259,6 +1262,7 @@ impl EmbeddedDecorationEvaluator {
             self.script_path.clone(),
             self.config_path.clone(),
             self.working_dir.clone(),
+            Some(self.host.clone()),
         )
         .map_err(DecorationEvaluationError::RuntimeProtocol)?;
         Ok(EmbeddedDecorationRuntime {
@@ -1549,6 +1553,68 @@ impl EmbeddedDecorationEvaluator {
             return Err(runtime_failed_error(runtime));
         };
         validate_interaction_response(&response, request_id, "gestureSwipe")?;
+        Ok(interaction_invocation_from_response(&self.host, response))
+    }
+
+    pub fn pointer_region(
+        &self,
+        event: &shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationPointerMoveAsyncInvocation, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let (display_state, input_state, runtime_state_generation) =
+            self.interaction_state_payload(runtime.last_sent_runtime_state_generation);
+
+        runtime.write_interaction_request(NativeInteractionRequest::PointerRegion {
+            request_id,
+            event: event.clone(),
+            now_ms,
+            display_state,
+            input_state,
+        })?;
+        runtime.last_sent_runtime_state_generation = runtime_state_generation;
+        let response = if let Some(response) = runtime.read_interaction_response()? {
+            response
+        } else {
+            return Err(runtime_failed_error(runtime));
+        };
+        validate_interaction_response(&response, request_id, "pointerRegion")?;
+        Ok(interaction_invocation_from_response(&self.host, response))
+    }
+
+    pub fn dnd_event(
+        &self,
+        event: &shojiwm_lib::dnd::DndEventSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationPointerMoveAsyncInvocation, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let (display_state, input_state, runtime_state_generation) =
+            self.interaction_state_payload(runtime.last_sent_runtime_state_generation);
+
+        runtime.write_interaction_request(NativeInteractionRequest::Dnd {
+            request_id,
+            event: event.clone(),
+            now_ms,
+            display_state,
+            input_state,
+        })?;
+        runtime.last_sent_runtime_state_generation = runtime_state_generation;
+        let response = if let Some(response) = runtime.read_interaction_response()? {
+            response
+        } else {
+            return Err(runtime_failed_error(runtime));
+        };
+        validate_interaction_response(&response, request_id, "dnd")?;
         Ok(interaction_invocation_from_response(&self.host, response))
     }
 
@@ -3194,6 +3260,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             request_id,
             workspace_id: &event.workspace_id,
             group_id: event.group_id.as_deref(),
+            window_id: event.window_id.as_deref(),
             now_ms,
             display_state: &display_state,
             input_state: &input_state,
@@ -4250,6 +4317,8 @@ mod tests {
     fn make_window(is_focused: bool) -> WaylandWindowSnapshot {
         WaylandWindowSnapshot {
             output_name: None,
+            plasma: None,
+            minimized_geometry: None,
             id: "1".into(),
             title: "Kitty".into(),
             app_id: Some("kitty".into()),

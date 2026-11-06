@@ -7,9 +7,9 @@ mod xwayland;
 // Wl Seat
 //
 
-use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
+use smithay::input::dnd::{DndGrabHandler, DndTarget, GrabType, Source};
 use smithay::input::keyboard::LedState;
-use smithay::input::pointer::{Focus, PointerHandle};
+use smithay::input::pointer::PointerHandle;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::desktop::{PopupKind, WindowSurfaceType, find_popup_root_surface, layer_map_for_output};
@@ -148,10 +148,67 @@ impl SeatHandler for ShojiWM {
     }
 }
 
-smithay::delegate_dispatch2!(ShojiWM);
+// Keep Smithay's Dispatch2 delegation, with one pre-dispatch barrier for
+// protocol-generated input which bypasses process_input_event (OSK and IME).
+impl<I, UserData> smithay::reexports::wayland_server::Dispatch<I, UserData> for ShojiWM
+where
+    I: Resource,
+    UserData: smithay::wayland::Dispatch2<I, ShojiWM>,
+{
+    fn request(
+        state: &mut Self,
+        client: &smithay::reexports::wayland_server::Client,
+        resource: &I,
+        request: I::Request,
+        data: &UserData,
+        display: &smithay::reexports::wayland_server::DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        if matches!(
+            I::interface().name,
+            "zwp_virtual_keyboard_v1" | "zwp_input_method_v2"
+        ) {
+            state.publish_xwayland_positions();
+        }
+        data.request(state, client, resource, request, display, data_init);
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: smithay::reexports::wayland_server::backend::ClientId,
+        resource: &I,
+        data: &UserData,
+    ) {
+        data.destroyed(state, client, resource);
+    }
+}
+
+impl<I, UserData> smithay::reexports::wayland_server::GlobalDispatch<I, UserData> for ShojiWM
+where
+    I: Resource,
+    UserData: smithay::wayland::GlobalDispatch2<I, ShojiWM>,
+{
+    fn bind(
+        state: &mut Self,
+        display: &smithay::reexports::wayland_server::DisplayHandle,
+        client: &smithay::reexports::wayland_server::Client,
+        resource: smithay::reexports::wayland_server::New<I>,
+        data: &UserData,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        data.bind(state, display, client, resource, data_init);
+    }
+
+    fn can_view(client: smithay::reexports::wayland_server::Client, data: &UserData) -> bool {
+        data.can_view(&client)
+    }
+}
 
 impl PointerConstraintsHandler for ShojiWM {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        if self.app_lock_ignored {
+            return;
+        }
         if pointer.current_focus().as_ref() != Some(surface) {
             return;
         }
@@ -250,6 +307,7 @@ impl SessionLockHandler for ShojiWM {
         self.session_lock_focus_owner = self.window_keyboard_focus_owner.take();
         self.window_keyboard_focus = None;
         if let Some(keyboard) = self.seat.get_keyboard() {
+            self.publish_xwayland_positions();
             keyboard.set_focus(
                 self,
                 Option::<WlSurface>::None,
@@ -265,6 +323,7 @@ impl SessionLockHandler for ShojiWM {
         self.session_lock_surfaces.clear();
         self.pointer_contents = crate::state::PointerContents::default();
         if let Some(keyboard) = self.seat.get_keyboard() {
+            self.publish_xwayland_positions();
             keyboard.set_focus(
                 self,
                 Option::<WlSurface>::None,
@@ -949,6 +1008,14 @@ impl DmabufHandler for ShojiWM {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
+        if let Some(import) = self.winit_dmabuf_import.as_mut() {
+            if import(&dmabuf) {
+                let _ = notifier.successful::<ShojiWM>();
+            } else {
+                notifier.failed();
+            }
+            return;
+        }
         // Every output is rendered on the GPU clients render with (`tty_render_node`), so that
         // is the one that has to take the buffer; another GPU importing it is no use.
         let render_node = self
@@ -1000,30 +1067,32 @@ impl DataDeviceHandler for ShojiWM {
     }
 }
 
-impl DndGrabHandler for ShojiWM {}
+impl DndGrabHandler for ShojiWM {
+    fn dropped(
+        &mut self,
+        _target: Option<DndTarget<'_, Self>>,
+        validated: bool,
+        _seat: Seat<Self>,
+        location: smithay::utils::Point<f64, Logical>,
+    ) {
+        self.queue_end_drag(crate::dnd::DragEndKind::Dropped, validated, location);
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>, location: smithay::utils::Point<f64, Logical>) {
+        self.queue_end_drag(crate::dnd::DragEndKind::Cancelled, false, location);
+    }
+}
+
 impl WaylandDndGrabHandler for ShojiWM {
     fn dnd_requested<S: Source>(
         &mut self,
         source: S,
-        _icon: Option<WlSurface>,
+        icon: Option<WlSurface>,
         seat: Seat<Self>,
         serial: Serial,
         type_: GrabType,
     ) {
-        match type_ {
-            GrabType::Pointer => {
-                let ptr = seat.get_pointer().unwrap();
-                let start_data = ptr.grab_start_data().unwrap();
-
-                // create a dnd grab to start the operation
-                let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
-                ptr.set_grab(self, grab, serial, Focus::Keep);
-            }
-            GrabType::Touch => {
-                // smallvil lacks touch handling
-                source.cancel();
-            }
-        }
+        self.start_drag(source, icon, seat, serial, type_);
     }
 }
 

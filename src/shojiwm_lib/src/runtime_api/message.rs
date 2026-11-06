@@ -125,12 +125,18 @@ pub enum InputRequest<'a> {
     KeyBinding { binding_id: &'a str },
     PointerMove(&'a PointerMoveEventSnapshot),
     GestureSwipe(&'a GestureSwipeEventSnapshot),
+    /// The pointer entered, left or pressed against a `defineRegion` region.
+    /// Answered like a pointer hook.
+    PointerRegion(&'a crate::runtime_pointer_region::PointerRegionEventSnapshot),
     /// Input taken by the config's input grab `grab_id`. Answered like a
     /// pointer hook; a runtime that does not grab answers `Unhandled`.
     InputGrab {
         grab_id: u64,
         event: &'a crate::runtime_input_grab::InputGrabEventSnapshot,
     },
+    /// A drag started, changed or ended. Sent only while the runtime asks
+    /// for it (`RuntimeEventConfigUpdate::dnd`). Answered like a pointer hook.
+    Dnd(&'a crate::dnd::DndEventSnapshot),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,6 +209,13 @@ pub enum CompositionPatch {
         node_id: String,
         node: DecorationNode,
     },
+    /// A node whose own props changed: `node` comes without children, and the
+    /// node keeps the ones it has. A root prop (a window's shadow) then does
+    /// not send the whole tree across the bridge again.
+    ReplaceProps {
+        node_id: String,
+        node: DecorationNode,
+    },
     /// The steady animation fast path. Mutate one uniform in the compositor's
     /// persistent tree without decoding or rebuilding the shader pipeline.
     ShaderUniform {
@@ -222,13 +235,16 @@ pub const OVERLAY_STAGE_INDEX: usize = u32::MAX as usize - 2;
 impl CompositionPatch {
     pub fn node_id(&self) -> &str {
         match self {
-            Self::ReplaceNode { node_id, .. } | Self::ShaderUniform { node_id, .. } => node_id,
+            Self::ReplaceNode { node_id, .. }
+            | Self::ReplaceProps { node_id, .. }
+            | Self::ShaderUniform { node_id, .. } => node_id,
         }
     }
 
+    /// The node a patch puts in place; without children for `ReplaceProps`.
     pub fn replacement_node(&self) -> Option<&DecorationNode> {
         match self {
-            Self::ReplaceNode { node, .. } => Some(node),
+            Self::ReplaceNode { node, .. } | Self::ReplaceProps { node, .. } => Some(node),
             Self::ShaderUniform { .. } => None,
         }
     }

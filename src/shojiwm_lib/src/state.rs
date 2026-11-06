@@ -275,6 +275,7 @@ pub struct ShojiWM {
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub xwayland_position_state: crate::xwayland_position::XwaylandPositionState,
     pub layer_shell_state: WlrLayerShellState,
     pub xdg_activation_state: XdgActivationState,
     pub xdg_decoration_state: XdgDecorationState,
@@ -297,6 +298,12 @@ pub struct ShojiWM {
         smithay::wayland::foreign_toplevel_list::ForeignToplevelListState,
     pub wlr_foreign_toplevel_manager_state:
         crate::wlr_foreign_toplevel::WlrForeignToplevelManagerState,
+    /// KDE's taskbar protocol, for plasmashell.
+    pub plasma_window_management_state:
+        crate::plasma_window_management::PlasmaWindowManagementState,
+    /// KDE's virtual desktops, for plasmashell's Pager.
+    pub plasma_virtual_desktop_state: crate::plasma_virtual_desktop::PlasmaVirtualDesktopState,
+    pub plasma_shell_state: crate::protocols::plasma_shell::PlasmaShellState,
     pub ext_workspace_manager_state: crate::workspace_manager::ExtWorkspaceManagerState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
     pub output_capture_source_state:
@@ -373,6 +380,10 @@ pub struct ShojiWM {
     pub config_runtime: RuntimeHandle,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
+    /// The nested (winit) session's check for `dmabuf_imported`: imports the buffer with the
+    /// winit renderer. There are no tty backends to try it on there.
+    pub winit_dmabuf_import:
+        Option<Box<dyn FnMut(&smithay::backend::allocator::dmabuf::Dmabuf) -> bool>>,
     /// `linux-drm-syncobj-v1` (explicit sync). `None` when the primary GPU cannot wait on
     /// syncobj timelines. Without this, drivers that provide no implicit dma-buf fences (the
     /// NVIDIA proprietary driver) let the compositor sample a client buffer before the client
@@ -459,6 +470,17 @@ pub struct ShojiWM {
     pub runtime_key_binding_entries: BTreeMap<String, RuntimeKeyBindingEntry>,
     pub runtime_key_bindings: Vec<CompiledRuntimeKeyBinding>,
     pub runtime_window_move_modifier: Option<RuntimePointerModifier>,
+    pub pointer_regions: crate::runtime_pointer_region::PointerRegionTracker,
+    /// `COMPOSITOR.cursor.setAppLockIgnored`.
+    pub app_lock_ignored_setting: bool,
+    /// `COMPOSITOR.cursor.bindAppLockIgnoreModifier`.
+    pub app_lock_ignore_modifier: Option<RuntimePointerModifier>,
+    /// Effective: the setting, or the modifier held. Client pointer locks and
+    /// confinements stay inactive while set.
+    pub app_lock_ignored: bool,
+    /// The surface whose lock was released when ignoring began; its cursor is
+    /// overridden with the default one meanwhile.
+    pub app_lock_released_surface: Option<WlSurface>,
     pub runtime_window_resize_modifier: Option<RuntimePointerModifier>,
     pub runtime_input_config: RuntimeInputConfig,
     pub runtime_applied_xkb_config: Option<crate::runtime_input::RuntimeKeyboardInputConfig>,
@@ -469,6 +491,10 @@ pub struct ShojiWM {
     pub runtime_pointer_move_async_enabled: bool,
     pub runtime_gesture_swipe_enabled: bool,
     pub runtime_gesture_swipe_async_enabled: bool,
+    /// The config listens to drag and drop (`COMPOSITOR.dnd.event.onStart`).
+    pub runtime_dnd_enabled: bool,
+    /// The drag in progress and the drag views the config shows.
+    pub dnd: crate::dnd::DndState,
     pub runtime_gesture_swipe: Option<RuntimeGestureSwipeState>,
     /// The config's input grab (`COMPOSITOR.input.grab`), if one is held.
     pub runtime_input_grab: Option<crate::runtime_input_grab::RuntimeInputGrabState>,
@@ -480,6 +506,8 @@ pub struct ShojiWM {
     pub tap_pressed_keys: u32,
     pub tap_armed_modifier: Option<crate::runtime_key_binding::ModifierClass>,
     pub tap_interrupted: bool,
+    /// Event time (ms) the tap modifier was pressed, for `within`.
+    pub tap_armed_at: u32,
     pub pending_tap_binding_ids: Vec<String>,
     pub suggested_window_offset: Option<(i32, i32)>,
     pub async_asset_dirty: bool,
@@ -618,6 +646,9 @@ pub struct ShojiWM {
     pub pending_pointer_input: Option<PendingPointerInput>,
     pub cursor_status: CursorImageStatus,
     pub cursor_override: Option<CursorIcon>,
+    /// `COMPOSITOR.cursor.overrideKind`: wins over the compositor's own
+    /// overrides and the clients' cursors.
+    pub config_cursor_override: Option<crate::cursor::CursorOverride>,
     pub cursor_theme: Cursor,
     pub pointer_images: Vec<(Image, MemoryRenderBuffer)>,
     pub current_pointer_image: Option<Image>,
@@ -733,6 +764,7 @@ impl ShojiWM {
         ));
         self.pointer_contents = self.pointer_contents_at(location);
         let under = self.pointer_contents.surface.clone();
+        self.publish_xwayland_positions();
         pointer.motion(
             self,
             under,
@@ -742,6 +774,7 @@ impl ShojiWM {
                 time: Duration::from(self.clock.now()).as_millis() as u32,
             },
         );
+        self.publish_xwayland_positions();
         pointer.frame(self);
     }
 
@@ -938,6 +971,7 @@ impl ShojiWM {
 
         if let Some(keyboard) = self.seat.get_keyboard()
             && keyboard.current_focus().as_ref() != focus.as_ref() {
+                self.publish_xwayland_positions();
                 keyboard.set_focus(self, focus, serial);
             }
     }
@@ -1453,6 +1487,7 @@ impl ShojiWM {
             if self.should_defer_initial_keyboard_focus(desired_focus.as_ref()) {
                 self.schedule_redraw();
             } else {
+                self.publish_xwayland_positions();
                 self.seat
                     .get_keyboard()
                     .unwrap()
@@ -1488,11 +1523,14 @@ impl ShojiWM {
             return;
         };
 
+        self.publish_xwayland_positions();
+
         keyboard.set_focus(
             self,
             Option::<WlSurface>::None,
             SERIAL_COUNTER.next_serial(),
         );
+        self.publish_xwayland_positions();
         keyboard.set_focus(self, Some(focus), SERIAL_COUNTER.next_serial());
     }
 
@@ -1520,6 +1558,7 @@ impl ShojiWM {
         // Initialize protocols needed for displaying windows
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let xwayland_position_state = crate::xwayland_position::XwaylandPositionState::new(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
@@ -1555,6 +1594,12 @@ impl ShojiWM {
             smithay::wayland::foreign_toplevel_list::ForeignToplevelListState::new::<Self>(&dh);
         let wlr_foreign_toplevel_manager_state =
             crate::wlr_foreign_toplevel::WlrForeignToplevelManagerState::new::<Self>(&dh);
+        let plasma_window_management_state =
+            crate::plasma_window_management::PlasmaWindowManagementState::new(&dh);
+        let plasma_virtual_desktop_state =
+            crate::plasma_virtual_desktop::PlasmaVirtualDesktopState::new(&dh);
+        crate::xdg_toplevel_tag::init_xdg_toplevel_tag(&dh);
+        let plasma_shell_state = crate::protocols::plasma_shell::PlasmaShellState::new(&dh);
         let ext_workspace_manager_state =
             crate::workspace_manager::ExtWorkspaceManagerState::new::<Self>(&dh);
         let image_capture_source_state =
@@ -1680,6 +1725,7 @@ impl ShojiWM {
                     }
                     if should_redraw {
                         state.async_asset_dirty = true;
+                        state.dnd.assets_dirty = true;
                         state.schedule_redraw();
                     }
                 }
@@ -1700,6 +1746,7 @@ impl ShojiWM {
 
             compositor_state,
             xdg_shell_state,
+            xwayland_position_state,
             layer_shell_state,
             xdg_activation_state,
             xdg_decoration_state,
@@ -1719,6 +1766,9 @@ impl ShojiWM {
             color_management_state,
             foreign_toplevel_list_state,
             wlr_foreign_toplevel_manager_state,
+            plasma_window_management_state,
+            plasma_virtual_desktop_state,
+            plasma_shell_state,
             ext_workspace_manager_state,
             image_capture_source_state,
             output_capture_source_state,
@@ -1773,6 +1823,7 @@ impl ShojiWM {
             config_runtime,
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
+            winit_dmabuf_import: None,
             drm_syncobj_state: None,
             implicit_sync_trusted: false,
             background_effect_state,
@@ -1819,6 +1870,11 @@ impl ShojiWM {
             runtime_key_binding_entries: Default::default(),
             runtime_key_bindings: Vec::new(),
             runtime_window_move_modifier: None,
+            pointer_regions: Default::default(),
+            app_lock_ignored_setting: false,
+            app_lock_ignore_modifier: None,
+            app_lock_ignored: false,
+            app_lock_released_surface: None,
             runtime_window_resize_modifier: None,
             runtime_input_config: Default::default(),
             runtime_applied_xkb_config: None,
@@ -1829,6 +1885,8 @@ impl ShojiWM {
             runtime_pointer_move_async_enabled: false,
             runtime_gesture_swipe_enabled: false,
             runtime_gesture_swipe_async_enabled: false,
+            runtime_dnd_enabled: false,
+            dnd: Default::default(),
             runtime_gesture_swipe: None,
             runtime_input_grab: None,
             pending_input_grab_key_event: None,
@@ -1836,6 +1894,7 @@ impl ShojiWM {
             tap_pressed_keys: 0,
             tap_armed_modifier: None,
             tap_interrupted: false,
+            tap_armed_at: 0,
             pending_tap_binding_ids: Vec::new(),
             suggested_window_offset: None,
             async_asset_dirty: false,
@@ -1900,6 +1959,7 @@ impl ShojiWM {
             pending_pointer_input: None,
             cursor_status: CursorImageStatus::default_named(),
             cursor_override: None,
+            config_cursor_override: None,
             cursor_theme: Cursor::load(),
             pointer_images: Vec::new(),
             current_pointer_image: None,
@@ -2200,6 +2260,7 @@ impl ShojiWM {
             Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
                 xwayland_refresh_override: true,
+                xwayland_position_allowed: true,
                 identity,
             }),
         ) {
@@ -2440,6 +2501,7 @@ impl ShojiWM {
                     Arc::new(ClientState {
                         compositor_state: CompositorClientState::default(),
                         xwayland_refresh_override: client_is_xwayland_bridge,
+                        xwayland_position_allowed: false,
                         identity: client_identity,
                     }),
                 ) {
@@ -2790,14 +2852,11 @@ impl ShojiWM {
                 // not force layer/popup effect evaluation every frame.
                 self.layer_effect_evaluation_cache.clear();
             }
-            let node_only_window_ids = tick
-                .dirty_window_node_ids
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            self.mark_runtime_dirty_windows(tick.dirty_window_ids, tick.dirty_managed_window_ids);
-            self.runtime_node_only_window_ids
-                .extend(node_only_window_ids);
+            self.mark_runtime_dirty_windows(
+                tick.dirty_window_ids,
+                tick.dirty_managed_window_ids,
+                &tick.dirty_window_node_ids,
+            );
             self.request_tty_maintenance("runtime-scheduler-dirty");
             self.schedule_redraw();
         }
@@ -2984,6 +3043,14 @@ impl ShojiWM {
                     self.apply_output_compositions(compositions);
                 }
                 HostMessage::InputGrab(update) => self.apply_runtime_input_grab_update(update),
+                HostMessage::CursorPosition(target) => self.set_cursor_position(target),
+                HostMessage::CursorOverride(kind) => {
+                    if self.config_cursor_override != kind {
+                        self.config_cursor_override = kind;
+                        self.schedule_redraw();
+                    }
+                }
+                HostMessage::DragView(command) => self.apply_drag_view_command(command),
                 HostMessage::BackgroundEffect(config) => {
                     if self.configured_background_effect != config {
                         self.configured_background_effect = config;
@@ -3058,6 +3125,8 @@ impl ShojiWM {
     pub fn warmup_decoration_runtime(&mut self) {
         let snapshot = WaylandWindowSnapshot {
             output_name: None,
+            plasma: None,
+            minimized_geometry: None,
             id: "__warmup__".into(),
             title: "warmup".into(),
             app_id: Some("shoji_wm.warmup".into()),
@@ -3179,8 +3248,14 @@ impl ShojiWM {
         // leaving the textures to the watchdog deadline.
         self.finalize_all_closing_snapshots("config-hot-reload");
 
-        // The reloaded config knows nothing about a grab the old one held.
+        // The reloaded config knows nothing about a grab the old one held,
+        // nor about its drag views and cursor override.
         self.end_runtime_input_grab(None);
+        self.dnd.reset_views(Instant::now());
+        self.config_cursor_override = None;
+        // The new config reports the hooks it listens to only when it has
+        // any: start from none, so the old config's do not stay on.
+        self.apply_runtime_event_config_update(RuntimeEventConfigUpdate::default());
         self.sync_runtime_display_state();
         let reload_result = self.config_runtime.reload();
         self.drain_runtime_host_messages();
@@ -3805,6 +3880,20 @@ impl ShojiWM {
     }
 
     pub fn apply_runtime_pointer_config_update(&mut self, update: RuntimePointerConfigUpdate) {
+        self.pointer_regions.set_regions(update.regions);
+        self.app_lock_ignored_setting = update.app_lock_ignored;
+        self.app_lock_ignore_modifier = update.app_lock_ignore_modifier.and_then(|shortcut| {
+            parse_runtime_pointer_modifier(&shortcut)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        app_lock_ignore_modifier = shortcut,
+                        ?error,
+                        "ignoring invalid runtime pointer modifier"
+                    );
+                })
+                .ok()
+        });
+        self.refresh_app_lock_ignored();
         self.runtime_window_move_modifier = update.window_move_modifier.and_then(|shortcut| {
             match parse_runtime_pointer_modifier(&shortcut) {
                 Ok(modifier) => Some(modifier),
@@ -3896,6 +3985,7 @@ impl ShojiWM {
     }
 
     pub fn apply_runtime_event_config_update(&mut self, update: RuntimeEventConfigUpdate) {
+        self.runtime_dnd_enabled = update.dnd;
         self.runtime_pointer_move_enabled = update.pointer_move;
         self.runtime_pointer_move_async_enabled = update.pointer_move_async;
         self.runtime_gesture_swipe_enabled = update.gesture_swipe;
@@ -3912,10 +4002,13 @@ impl ShojiWM {
         &mut self,
         update: Option<RuntimeWorkspaceConfigUpdate>,
     ) {
-        if let Some(update) = update {
+        if let Some(mut update) = update {
+            let virtual_desktops = update.virtual_desktops.take();
             let outputs = self.space.outputs().cloned().collect::<Vec<_>>();
             self.ext_workspace_manager_state
                 .sync::<Self>(update, &self.display_handle, &outputs);
+            // Every update carries the whole model: no desktops means none.
+            self.consume_runtime_virtual_desktop_config(virtual_desktops);
         }
     }
 
@@ -3943,31 +4036,46 @@ impl ShojiWM {
         self.schedule_redraw();
     }
 
+    /// Mark the windows a runtime turn left dirty. `dirty_window_node_ids` lists the ones
+    /// whose change stayed inside nodes (node props, shader uniforms): those keep the cached
+    /// patch / uniform paths instead of a full re-evaluation. Every turn reports it — a key
+    /// binding, a gesture or a pointer hook as much as a scheduler tick — and dropping it
+    /// re-evaluated every window a turn touched in full: a tiled workspace scrolled by a
+    /// key or a swipe re-evaluated all its tiles on each step.
     pub fn mark_runtime_dirty_windows(
         &mut self,
         dirty_window_ids: impl IntoIterator<Item = String>,
         dirty_managed_window_ids: impl IntoIterator<Item = String>,
+        dirty_window_node_ids: &HashMap<String, Vec<String>>,
     ) {
         let managed_only = dirty_managed_window_ids
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         for window_id in dirty_window_ids {
+            let node_only = dirty_window_node_ids.contains_key(&window_id);
             if runtime_dirty_debug_enabled() {
                 info!(
                     window_id = %window_id,
                     managed_only = managed_only.contains(&window_id),
+                    node_only,
                     "runtime dirty debug: mark window dirty"
                 );
             }
-            if managed_only.contains(&window_id)
-                && !self.runtime_dirty_window_ids.contains(&window_id)
-            {
+            let already_dirty = self.runtime_dirty_window_ids.contains(&window_id);
+            if managed_only.contains(&window_id) && !already_dirty {
                 self.runtime_managed_only_window_ids
                     .insert(window_id.clone());
             } else {
                 self.runtime_managed_only_window_ids.remove(&window_id);
             }
-            self.runtime_node_only_window_ids.remove(&window_id);
+            // A window already waiting for a full re-evaluation stays that way.
+            if node_only
+                && (!already_dirty || self.runtime_node_only_window_ids.contains(&window_id))
+            {
+                self.runtime_node_only_window_ids.insert(window_id.clone());
+            } else {
+                self.runtime_node_only_window_ids.remove(&window_id);
+            }
             self.runtime_dirty_window_ids.insert(window_id);
         }
     }
@@ -3999,6 +4107,7 @@ impl ShojiWM {
             self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
+                &invocation.dirty_window_node_ids,
             );
             self.request_tty_maintenance(match dispatch_mode {
                 "sync" => "runtime-pointer-move-dirty",
@@ -4288,7 +4397,7 @@ impl ShojiWM {
     /// the Top layer (only Overlay stays in front of it). `with_committed_state`
     /// (client-acked) means this flips on only once the client has actually
     /// committed its fullscreen buffer, matching what is on screen.
-    fn output_has_topmost_fullscreen_window(&self, output: &Output) -> bool {
+    pub(crate) fn output_has_topmost_fullscreen_window(&self, output: &Output) -> bool {
         self.windows_for_output_top_to_bottom(output)
             .first()
             .and_then(|window| window.toplevel())
@@ -4359,6 +4468,13 @@ impl ShojiWM {
         }
 
         if let Some((window, decoration)) = self.window_under_transformed(logical_pos) {
+            // The resize band outside the frame belongs to the decoration; it
+            // must not give the pointer to the client or a window below.
+            if !transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform)
+                .contains(logical_pos)
+            {
+                return None;
+            }
             let transformed_client = transformed_rect(
                 decoration.client_rect,
                 decoration.layout.root.rect,
@@ -4641,9 +4757,9 @@ impl ShojiWM {
             }
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
-            if !transformed_root.contains(logical_pos)
-                || !self.client_input_region_accepts(window, Some(decoration), pos)
-            {
+            let inside = transformed_root.contains(logical_pos)
+                && self.client_input_region_accepts(window, Some(decoration), pos);
+            if !inside && !decoration.resize_band_contains(pos) {
                 return None;
             }
             Some((window, decoration))
@@ -5599,6 +5715,8 @@ impl ShojiWM {
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
     pub xwayland_refresh_override: bool,
+    /// Only the connection inserted by the embedded bridge receives positions.
+    pub(crate) xwayland_position_allowed: bool,
     identity: WaylandClientIdentity,
 }
 

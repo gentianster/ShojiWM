@@ -9,6 +9,7 @@
 //! Shaders and icons are shared with the TypeScript config: relative asset
 //! paths resolve against `packages/config`.
 
+mod drag_and_drop;
 mod flip_3d;
 mod island_glass;
 mod window_animation;
@@ -32,15 +33,16 @@ use shojiwm_rs::{
     runtime_workspace::{RuntimeWorkspaceConfigUpdate, RuntimeWorkspaceEntry, RuntimeWorkspaceGroupConfig},
     ssd::{
         OpaqueRegionPolicy, PointerMoveEventSnapshot, PopupParentKindSnapshot, SurfacePolicy,
-        WindowDecorationModeSnapshot,
+        WindowDecorationModeSnapshot, WindowDecorationStateSnapshot,
     },
 };
 
 use crate::{
+    drag_and_drop::install_drag_and_drop,
     flip_3d::create_flip_3d,
     island_glass::island_glass,
     window_grid::create_window_grid,
-    window_switcher::WindowSwitcher,
+    window_switcher::{TitlebarButton, WindowSwitcher},
     window_manager::{
         TITLEBAR_HEIGHT, WINDOW_BORDER_PX, WINDOW_STATE_FULLSCREEN, WINDOW_STATE_MINIMIZE_VISUAL_IDLE,
         WINDOW_STATE_MINIMIZED, WINDOW_STATE_RECT, WINDOW_STATE_TILE_DRAGGING, WINDOW_STATE_TILE_REORDERING,
@@ -78,14 +80,32 @@ fn main() -> std::process::ExitCode {
         .run()
 }
 
+/// Whether the client draws its own title bar.
+fn uses_client_decoration(decoration: &WindowDecorationStateSnapshot) -> bool {
+    decoration.mode == WindowDecorationModeSnapshot::Client
+        && !(decoration.client_preference == Some(WindowDecorationModeSnapshot::Server)
+            && decoration.configured_mode == WindowDecorationModeSnapshot::Server)
+}
+
 /// The client geometry plus the frame the decoration adds around it.
+///
+/// Must match the frame the composition draws: a client-decorated window gets
+/// only the border, so counting the title bar would size its client past what
+/// the layout meant (and past the client's own maximum). The border is drawn
+/// for both, so it is counted for both; a config that drops the border for
+/// client-decorated windows must drop `WINDOW_BORDER_PX` here too.
 fn natural_root_rect(window: Window) -> Rect {
     let client = window.position().get_untracked();
+    let titlebar = if uses_client_decoration(&window.decoration().get_untracked()) {
+        0.0
+    } else {
+        TITLEBAR_HEIGHT
+    };
     Rect::new(
         client.x - WINDOW_BORDER_PX,
-        client.y - TITLEBAR_HEIGHT - WINDOW_BORDER_PX,
+        client.y - titlebar - WINDOW_BORDER_PX,
         client.width + WINDOW_BORDER_PX * 2.0,
-        client.height + TITLEBAR_HEIGHT + WINDOW_BORDER_PX * 2.0,
+        client.height + titlebar + WINDOW_BORDER_PX * 2.0,
     )
 }
 
@@ -131,6 +151,11 @@ fn setup() {
             WindowSwitcherStyle::Grid => create_window_grid(wm.clone(), stack_order),
         }
     };
+    // The grid's selected card: its title bar buttons work.
+    switcher.set_titlebar_button_at(titlebar_button_at);
+    // Drag and drop: the dragged image on a card with the action and the
+    // kind of data, flying back when a drop is refused (drag_and_drop.rs).
+    install_drag_and_drop();
     {
         let switcher = switcher.clone();
         COMPOSITOR
@@ -239,6 +264,7 @@ fn setup_ipc(wm: &WindowManager) -> Ipc {
         COMPOSITOR.workspace.configure(move || {
             let view = wm.read(|wm| wm.view_for_ipc());
             RuntimeWorkspaceConfigUpdate {
+                virtual_desktops: None,
                 groups: view
                     .monitors
                     .iter()
@@ -296,7 +322,11 @@ fn setup_ipc(wm: &WindowManager) -> Ipc {
         {
             let ipc = ipc.clone();
             server.handle("workspaces.activate", move |params| {
-                if let (Some(monitor), Some(index)) = (params["monitor"].as_str(), params["index"].as_u64()) {
+                // Any JSON number, as in TypeScript (`2.0` too); workspaces
+                // are numbered by whole numbers, though.
+                let index = params["index"].as_f64().filter(|index| *index >= 0.0 && index.fract() == 0.0);
+                let monitor = params["monitor"].as_str().filter(|monitor| !monitor.is_empty());
+                if let (Some(monitor), Some(index)) = (monitor, index) {
                     ipc.wm.with(|wm| wm.activate(monitor, index as u32));
                     ipc.schedule_workspace_broadcast();
                 }
@@ -417,7 +447,7 @@ fn setup_key_bindings(wm: &WindowManager, ipc: &Ipc, switcher: &WindowSwitcher) 
     };
     COMPOSITOR.key.bind("launcher", "Super+A", toggle_launcher.clone());
     // A Super tap: fires on release when nothing else was pressed meanwhile.
-    COMPOSITOR.key.bind_release("launcher-tap", "Super", toggle_launcher);
+    COMPOSITOR.key.bind_tap("launcher-tap", "Super", 300, toggle_launcher);
     {
         let wm = wm.clone();
         COMPOSITOR.key.bind("clipboard", "Super+V", move || {
@@ -448,7 +478,7 @@ fn setup_key_bindings(wm: &WindowManager, ipc: &Ipc, switcher: &WindowSwitcher) 
     bind("toggle-tiling-mode", "Super+S", true, |wm| wm.toggle_current_workspace_tiling());
     {
         let (wm, switcher) = (wm.clone(), switcher.clone());
-        COMPOSITOR.key.bind("switcher-3d", "Super+Tab", move || {
+        COMPOSITOR.key.bind("window-switcher", "Super+Tab", move || {
             let monitor = wm.with(|wm| wm.current_monitor_name());
             switcher.open(&monitor);
         });
@@ -541,6 +571,7 @@ fn setup_outputs_and_input() {
 
     COMPOSITOR.pointer.bind_window_move_modifier("Super");
     COMPOSITOR.pointer.bind_window_resize_modifier("Super");
+    COMPOSITOR.cursor.bind_app_lock_ignore_modifier("Super");
 }
 
 /// Window backdrop effects end with this stage so they can fade back in
@@ -751,9 +782,7 @@ fn setup_composition(wm: &WindowManager, switcher: &WindowSwitcher) {
         // Read in the body on purpose: these switch the whole structure, so a
         // change re-runs this function (like the TSX version).
         let decoration = window.decoration().get();
-        let use_client_decoration = decoration.mode == WindowDecorationModeSnapshot::Client
-            && !(decoration.client_preference == Some(WindowDecorationModeSnapshot::Server)
-                && decoration.configured_mode == WindowDecorationModeSnapshot::Server);
+        let use_client_decoration = uses_client_decoration(&decoration);
         let fullscreen = window.state(&WINDOW_STATE_FULLSCREEN).get();
         let is_terminal = matches!(window.app_id().get().as_deref(), Some("kitty" | "ghostty"));
 
@@ -857,6 +886,40 @@ fn setup_composition(wm: &WindowManager, switcher: &WindowSwitcher) {
     });
 }
 
+/// The title bar's button size, padding and gap. `titlebar_button_at` finds
+/// the buttons with the same numbers, so change them here.
+const TITLEBAR_BUTTON_SIZE: f64 = 16.0;
+const TITLEBAR_PADDING_X: f64 = 8.0;
+const TITLEBAR_GAP: f64 = 8.0;
+
+/// The title bar button at `(x, y)`, logical px from the top-left corner of
+/// `window.rect()` (the frame: border, then the title bar). From the right:
+/// close, maximize, minimize. Each button takes the whole title bar height
+/// and half the gap on both sides, so a scaled-down card still has a usable
+/// target.
+fn titlebar_button_at(window: Window, x: f64, y: f64) -> Option<TitlebarButton> {
+    if window.state(&WINDOW_STATE_FULLSCREEN).get_untracked()
+        || uses_client_decoration(&window.decoration().get_untracked())
+    {
+        return None;
+    }
+    titlebar_button_in(window.rect().width, x, y)
+}
+
+/// [`titlebar_button_at`] for a server-decorated frame `frame_width` wide.
+fn titlebar_button_in(frame_width: f64, x: f64, y: f64) -> Option<TitlebarButton> {
+    if !(WINDOW_BORDER_PX..=WINDOW_BORDER_PX + TITLEBAR_HEIGHT).contains(&y) {
+        return None;
+    }
+    let buttons = [TitlebarButton::Close, TitlebarButton::Maximize, TitlebarButton::Minimize];
+    let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_GAP;
+    let right = frame_width - WINDOW_BORDER_PX - TITLEBAR_PADDING_X;
+    buttons.into_iter().enumerate().find_map(|(index, button)| {
+        let center = right - TITLEBAR_BUTTON_SIZE / 2.0 - index as f64 * pitch;
+        ((x - center).abs() <= pitch / 2.0).then_some(button)
+    })
+}
+
 /// Titlebar and client area of a server-side decorated window. Without
 /// `blur` (the window switcher is open) there are no backdrop effects.
 fn decorated_contents(window: Window, is_terminal: bool, blur: Option<&WindowSwitcher>) -> Element {
@@ -868,8 +931,8 @@ fn decorated_contents(window: Window, is_terminal: bool, blur: Option<&WindowSwi
         .map(|focused| if *focused { hex("#f5f7fa") } else { hex("#c9d1d9") });
     let titlebar_style = Style::new()
         .height(TITLEBAR_HEIGHT)
-        .padding_x(8.0)
-        .gap(8.0)
+        .padding_x(TITLEBAR_PADDING_X)
+        .gap(TITLEBAR_GAP)
         .align_items(AlignItems::Center)
         .background(titlebar_background);
 
@@ -978,7 +1041,7 @@ fn title_button(
                 .on_click(on_click)
                 .style(
                     Style::new()
-                        .size(16.0, 16.0)
+                        .size(TITLEBAR_BUTTON_SIZE, TITLEBAR_BUTTON_SIZE)
                         .border_radius(8.0)
                         .background(hex("#FFFFFF20"))
                         .border(1.0, hover_border),
@@ -991,7 +1054,7 @@ fn title_button(
 fn button_icon(src: impl Into<Prop<String>>) -> Element {
     Image::new(src).style(
         Style::new()
-            .size(16.0, 16.0)
+            .size(TITLEBAR_BUTTON_SIZE, TITLEBAR_BUTTON_SIZE)
             .absolute()
             .z_index(1)
             .pointer_events_none(),
@@ -1113,6 +1176,8 @@ mod tests {
     fn window(id: &str, focused: bool) -> WaylandWindowSnapshot {
         WaylandWindowSnapshot {
             output_name: None,
+            plasma: None,
+            minimized_geometry: None,
             id: id.into(),
             title: format!("window {id}"),
             app_id: Some("org.example.App".into()),
@@ -1237,6 +1302,20 @@ mod tests {
     }
 
     #[test]
+    fn titlebar_buttons_are_found_from_the_right() {
+        let width = 800.0;
+        let y = WINDOW_BORDER_PX + TITLEBAR_HEIGHT / 2.0;
+        let right = width - WINDOW_BORDER_PX - TITLEBAR_PADDING_X;
+        let center = |index: f64| right - TITLEBAR_BUTTON_SIZE / 2.0 - index * (TITLEBAR_BUTTON_SIZE + TITLEBAR_GAP);
+        assert_eq!(titlebar_button_in(width, center(0.0), y), Some(TitlebarButton::Close));
+        assert_eq!(titlebar_button_in(width, center(1.0), y), Some(TitlebarButton::Maximize));
+        assert_eq!(titlebar_button_in(width, center(2.0), y), Some(TitlebarButton::Minimize));
+        // The title, and the client area below the title bar, are no buttons.
+        assert_eq!(titlebar_button_in(width, center(4.0), y), None);
+        assert_eq!(titlebar_button_in(width, center(0.0), WINDOW_BORDER_PX + TITLEBAR_HEIGHT + 1.0), None);
+    }
+
+    #[test]
     fn title_button_tooltips_wait_for_a_resting_hover() {
         use shojiwm_rs::ssd::{DecorationNode, DecorationNodeKind};
 
@@ -1295,4 +1374,121 @@ mod tests {
         let cached = runtime.evaluate_cached_window("w1", None, 1600, false).unwrap();
         assert!(!opened(&cached));
     }
+
+    /// The drag card: the badge follows the action, and a refused drop flies
+    /// back to the origin, fades out and is disposed of.
+    #[test]
+    fn drag_card_flies_back_after_a_refused_drop() {
+        use shojiwm_rs::{
+            HostMessage,
+            dnd::{DragDevice, DragEndKind, DragPoint},
+            ssd::{DecorationNode, DecorationNodeKind},
+        };
+        use shojiwm_lib::dnd::{DndEventSnapshot, DragSnapshot, DragViewCommand};
+
+        let host = RuntimeHost::detached();
+        let args = CommonArgs::parse(&[], &[]);
+        let launcher = ConfigBuilder::new(|| crate::drag_and_drop::install_drag_and_drop())
+            .asset_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/config"));
+        let mut runtime = RuntimeBoot::new(Box::new(launcher), &args).launch(host.clone());
+        runtime.preload().unwrap();
+        runtime.enable().unwrap();
+        let commands = || -> Vec<DragViewCommand> {
+            std::iter::from_fn(|| host.pop())
+                .filter_map(|message| match message {
+                    HostMessage::DragView(command) => Some(command),
+                    _ => None,
+                })
+                .collect()
+        };
+        fn labels(node: &DecorationNode, out: &mut Vec<String>) {
+            if let DecorationNodeKind::Label(label) = &node.kind {
+                out.push(label.text.clone());
+            }
+            node.children.iter().for_each(|child| labels(child, out));
+        }
+        let content_labels = |commands: &[DragViewCommand]| {
+            commands.iter().rev().find_map(|command| match command {
+                DragViewCommand::Content { content: Some(tree), .. } => {
+                    let mut out = Vec::new();
+                    labels(tree, &mut out);
+                    Some(out)
+                }
+                _ => None,
+            })
+        };
+        let last_props = |commands: &[DragViewCommand]| {
+            commands.iter().rev().find_map(|command| match command {
+                DragViewCommand::Props { props, .. } => Some(*props),
+                _ => None,
+            })
+        };
+
+        commands();
+        let start = DndEventSnapshot::Start {
+            drag: DragSnapshot {
+                id: 1,
+                mime_types: vec!["text/uri-list".into()],
+                actions: Default::default(),
+                action: DragAction::None,
+                source_window_id: None,
+                target_window_id: None,
+                device: DragDevice::Pointer,
+                origin: DragPoint { x: 100.0, y: 200.0 },
+                icon: None,
+            },
+        };
+        runtime.dnd_event(&start, 1000).unwrap();
+        let sent = commands();
+        assert_eq!(content_labels(&sent), Some(vec!["File".to_string()]));
+        let props = last_props(&sent).unwrap();
+        assert_eq!(props.anchor, DragViewAnchor::Pointer);
+        assert!((props.scale - 0.85).abs() < 1e-6 && props.opacity == 0.0, "{props:?}");
+
+        let mut now = 1000.0;
+        for _ in 0..20 {
+            now += 16.0;
+            runtime.scheduler_tick(now).unwrap();
+        }
+        let props = last_props(&commands()).unwrap();
+        assert!(props.opacity == 1.0 && props.scale == 1.0, "popped in: {props:?}");
+
+        let update = DndEventSnapshot::Update {
+            drag_id: 1,
+            action: DragAction::Copy,
+            target_window_id: None,
+            icon: None,
+        };
+        runtime.dnd_event(&update, now as u64).unwrap();
+        assert_eq!(content_labels(&commands()), Some(vec!["+".to_string(), "File".to_string()]));
+
+        let end = DndEventSnapshot::End {
+            drag_id: 1,
+            kind: DragEndKind::Dropped,
+            accepted: false,
+            target_window_id: None,
+            position: DragPoint { x: 500.0, y: 600.0 },
+        };
+        runtime.dnd_event(&end, now as u64).unwrap();
+        let props = last_props(&commands()).unwrap();
+        assert_eq!((props.anchor, props.x, props.y), (DragViewAnchor::Global, 500.0, 600.0));
+        let mut disposed = false;
+        let mut last = props;
+        for _ in 0..40 {
+            now += 16.0;
+            runtime.scheduler_tick(now).unwrap();
+            let sent = commands();
+            if let Some(props) = last_props(&sent) {
+                last = props;
+            }
+            if sent.iter().any(|command| matches!(command, DragViewCommand::Dispose { .. })) {
+                disposed = true;
+                break;
+            }
+        }
+        assert!(disposed, "the view goes once it flew back");
+        assert!((last.x - 100.0).abs() < 1.0 && (last.y - 200.0).abs() < 1.0, "back at the origin: {last:?}");
+        assert!(last.opacity < 0.01, "faded out: {last:?}");
+    }
+
 }
