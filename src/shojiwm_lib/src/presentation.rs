@@ -721,6 +721,9 @@ impl ShojiWM {
         if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &self.cursor_status {
             send_frames_surface_tree(surface, output, time, throttle, &should_send);
         }
+        if let Some(surface) = self.dnd.active_icon_surface() {
+            send_frames_surface_tree(surface, output, time, throttle, &should_send);
+        }
 
         if debug {
             info!(
@@ -820,6 +823,11 @@ impl ShojiWM {
         if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &self.cursor_status {
             send_frames_surface_tree(surface, output, time, throttle, &should_send);
         }
+        // The drag icon is a client surface like the cursor: a client waiting
+        // for its frame callback would stop updating it.
+        if let Some(surface) = self.dnd.active_icon_surface() {
+            send_frames_surface_tree(surface, output, time, throttle, &should_send);
+        }
 
         if debug {
             info!(
@@ -885,8 +893,12 @@ impl ShojiWM {
                             "commit timer barrier signaled for window surface"
                         );
                     }
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    // A client that just disconnected can still have surfaces in the
+                    // window/layer lists until its windows are torn down; there is
+                    // nobody left to wake.
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         });
@@ -900,8 +912,9 @@ impl ShojiWM {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                     && commit_timer_state.signal_until(frame_target)
                 {
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -1063,8 +1076,9 @@ impl ShojiWM {
                             );
                         }
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     } else if debug_fifo {
                         info!(
                             surface = ?surface.id(),
@@ -1108,8 +1122,9 @@ impl ShojiWM {
                     .take();
                 if let Some(fifo_barrier) = fifo_barrier {
                     fifo_barrier.signal();
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -1156,9 +1171,12 @@ impl ShojiWM {
         // these notifications it never learns that the cursor moved to a different-scale
         // output and renders cursors at the wrong size (most visibly: huge near monitor edges
         // and after crossing scale boundaries).
-        if let smithay::input::pointer::CursorImageStatus::Surface(cursor_surface) =
-            &self.cursor_status
-        {
+        let cursor_surface = match &self.cursor_status {
+            smithay::input::pointer::CursorImageStatus::Surface(surface) => Some(surface),
+            _ => None,
+        };
+        // The drag icon too: a client sizes it for the scale it is shown at.
+        for cursor_surface in cursor_surface.into_iter().chain(self.dnd.active_icon_surface()) {
             with_surfaces_surface_tree(cursor_surface, |surface, states| {
                 let primary_scanout_output = surface_primary_scanout_output(surface, states);
                 if let Some(scanout) = primary_scanout_output.as_ref() {

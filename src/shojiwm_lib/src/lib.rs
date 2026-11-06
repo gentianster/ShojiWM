@@ -39,6 +39,7 @@ pub mod config;
 pub mod config_error;
 pub mod control_socket;
 pub mod cursor;
+pub mod dnd;
 pub mod frame_pacing;
 pub mod drawing;
 pub mod foreign_toplevel;
@@ -46,7 +47,11 @@ pub mod grabs;
 pub mod handlers;
 pub mod input;
 pub mod keyboard_layout;
+pub mod log_rate_limit;
 pub mod output_power;
+pub mod plasma_virtual_desktop;
+pub mod plasma_window_management;
+pub mod xdg_toplevel_tag;
 pub mod presentation;
 pub mod presentation_test_client;
 pub mod process_env;
@@ -58,6 +63,7 @@ pub mod runtime_input;
 pub mod runtime_input_grab;
 pub mod runtime_key_binding;
 pub mod runtime_pointer;
+pub mod runtime_pointer_region;
 pub mod runtime_process;
 pub mod runtime_workspace;
 pub mod ssd;
@@ -66,6 +72,7 @@ pub mod window_decoration;
 pub mod wlr_foreign_toplevel;
 pub mod workspace_manager;
 pub mod xwayland_satellite;
+pub mod xwayland_position;
 
 // Owned by the library rather than each binary: every ShojiWM build wants the
 // same allocator, and the frame-time budget was measured with this one.
@@ -267,12 +274,21 @@ fn init_logging(
         .buffered_lines_limit(64 * 1024)
         .finish(log_file);
 
-    tracing_subscriber::fmt()
-        .compact()
-        .with_ansi(false)
-        .with_writer(writer)
-        .with_env_filter(env_filter)
-        .init();
+    // One warning per surface per frame must not fill the disk: see
+    // `log_rate_limit`.
+    let rate_limit = log_rate_limit::enabled_from_env()
+        .then(|| log_rate_limit::LogRateLimitLayer::new(writer.clone()));
+    {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::fmt()
+            .compact()
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_env_filter(env_filter)
+            .finish()
+            .with(rate_limit)
+            .init();
+    }
 
     // After the subscriber is installed, so the summary lands in the log it
     // just pruned around.

@@ -145,7 +145,7 @@ type NativeCompositionUpdate =
   | {
       kind: "patches";
       windowId: string;
-      patches: Array<{ nodeId: string; node: unknown }>;
+      patches: Array<{ nodeId: string; node: unknown; keepChildren?: boolean }>;
     };
 
 type NativeEffectUpdate =
@@ -361,8 +361,12 @@ import {
   type RuntimeWindowFullscreenRequestEvent,
   type RuntimeWindowActivateRequestEvent,
   type PointerMoveEvent,
+  type PointerRegionEvent,
   type GestureSwipeEvent,
   dispatchInputGrabEvent,
+  dispatchDndEvent,
+  installDndWindowResolver,
+  type DndEvent,
   type RuntimeEventConfig,
   type RuntimePersistedState,
   updateOutputState,
@@ -387,7 +391,11 @@ import {
   type ManagedWindowState,
   type WindowTransform,
 } from "../packages/shoji_wm/src/index.ts";
-import { peekDirtyWindowNodeIds } from "../packages/shoji_wm/src/runtime-hooks.ts";
+import {
+  clearRuntimeWatchDependencies,
+  peekDirtyWindowNodeIds,
+  withRuntimeWatchDependencyScope,
+} from "../packages/shoji_wm/src/runtime-hooks.ts";
 import { currentOutputList } from "../packages/shoji_wm/src/output.ts";
 import {
   serializeOutputComposition,
@@ -663,6 +671,24 @@ interface GestureSwipeRequest {
   inputState?: Record<string, InputDeviceInfo>;
 }
 
+interface PointerRegionRequest {
+  requestId: number;
+  kind: "pointerRegion";
+  event: PointerRegionEvent;
+  nowMs: number;
+  displayState?: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
+interface DndRequest {
+  requestId: number;
+  kind: "dnd";
+  event: DndEvent;
+  nowMs: number;
+  displayState?: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
 interface InputGrabRequest {
   requestId: number;
   kind: "inputGrab";
@@ -722,6 +748,7 @@ interface WorkspaceActivateRequest {
   kind: "workspaceActivate";
   workspaceId: string;
   groupId?: string;
+  windowId?: string;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
   inputState?: Record<string, InputDeviceInfo>;
@@ -746,7 +773,9 @@ type RuntimeRequest =
   | WindowActivateRequest
   | PointerMoveRequest
   | GestureSwipeRequest
+  | PointerRegionRequest
   | InputGrabRequest
+  | DndRequest
   | GetEffectConfigRequest
   | EvaluateLayerEffectsRequest
   | EvaluatePopupEffectsRequest
@@ -1050,7 +1079,9 @@ interface NativeInteractionSuccess {
     | "pointerMoveAsync"
     | "gestureSwipe"
     | "gestureSwipeAsync"
+    | "pointerRegion"
     | "inputGrab"
+    | "dnd"
     | "windowMove"
     | "windowResize";
   invoked: boolean;
@@ -1260,6 +1291,7 @@ const decorationPolicyWindowById = new Map<
   DecorationPolicyWindowEntry
 >();
 const openedWindowIds = new Set<string>();
+installDndWindowResolver((id) => cacheByWindowId.get(id)?.cache.window ?? null);
 const initialConfiguredWindowIds = new Set<string>();
 const firstCommittedWindowIds = new Set<string>();
 const animationEntriesByWindowId = new Map<string, Map<symbol, unknown>>();
@@ -1637,7 +1669,9 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
           case "lifecycleDisable":
           case "windowDecorationPolicy":
           case "workspaceActivate":
+          case "pointerRegion":
           case "inputGrab":
+          case "dnd":
             break;
         }
       }
@@ -1695,6 +1729,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
         const invoked = emitWorkspaceActivate({
           workspaceId: request.workspaceId,
           groupId: request.groupId,
+          windowId: request.windowId,
         });
         const mutation = invoked
           ? collectRuntimeMutationState()
@@ -2326,6 +2361,54 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
               processConfig,
               processActions,
             });
+          } else if (request.kind === "pointerRegion") {
+            const result = interactionMutationResult(
+              events.emitPointerRegion(request.event),
+            );
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeInteractionEventResponse(embeddedBridge, {
+              requestId: request.requestId,
+              ok: true,
+              kind: request.kind,
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              workspaceConfig: pendingWorkspaceConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
+          } else if (request.kind === "dnd") {
+            const result = interactionMutationResult(
+              dispatchDndEvent(request.event),
+            );
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeInteractionEventResponse(embeddedBridge, {
+              requestId: request.requestId,
+              ok: true,
+              kind: request.kind,
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              workspaceConfig: pendingWorkspaceConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
           } else if (request.kind === "inputGrab") {
             const result = interactionMutationResult(
               dispatchInputGrabEvent(request.grabId, request.event),
@@ -2576,11 +2659,17 @@ function evaluateCached(
       dirtyUniformBindingKeys,
     );
     if (uniformPatches !== null && uniformPatches.length > 0) {
+      // Snapshot the managed window like the other paths do. A managed-window
+      // write (a transform the config animates, say) that lands with the
+      // uniform writes is not "managed-only", and the scheduler tick drops
+      // its mark for a window that is dirty anyway; reusing the cached
+      // transform here would lose it for good once the uniforms settle.
+      const managed = entry.cache.reevaluateManagedWindow();
       return {
         treeUpdate: "uniforms",
         uniformPatches,
-        transform: entry.cache.lastTransform,
-        managedWindow: entry.cache.lastManagedWindow,
+        transform: managed.transform,
+        managedWindow: managed.managedWindow,
         windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
         dirtyNodeIds: Array.from(
           new Set(uniformPatches.map((patch) => patch.nodeId)),
@@ -2783,6 +2872,19 @@ function writeCachedCompositionUpdate(
       throw new Error(
         `dirty composition node ${nodeId} is missing from ${windowId}`,
       );
+    }
+    // Children the serializer kept (the same objects as last sent) stay in
+    // the compositor's tree: send the node alone. Converting the subtree is
+    // most of a patch's cost, and a root prop would send the whole window.
+    if (
+      previous !== undefined &&
+      haveSameChildren(findSerializedNode(previous, nodeId), node)
+    ) {
+      return {
+        nodeId,
+        node: { ...(node as Record<string, unknown>), children: [] },
+        keepChildren: true,
+      };
     }
     return { nodeId, node };
   });
@@ -3073,6 +3175,17 @@ function topLevelDirtyNodeIds(nodeIds: readonly string[]): string[] {
     selected.push(nodeId);
   }
   return selected;
+}
+
+function haveSameChildren(previous: unknown, next: unknown): boolean {
+  const previousChildren = (previous as { children?: unknown } | undefined)?.children;
+  const nextChildren = (next as { children?: unknown } | undefined)?.children;
+  return (
+    Array.isArray(previousChildren) &&
+    Array.isArray(nextChildren) &&
+    previousChildren.length === nextChildren.length &&
+    previousChildren.every((child, index) => child === nextChildren[index])
+  );
 }
 
 function findSerializedNode(tree: unknown, nodeId: string): unknown {
@@ -4113,7 +4226,9 @@ function evaluateOutputComposition(
     }
     first = false;
     try {
-      slot.plan = serializeOutputComposition(compose(output));
+      slot.plan = withRuntimeWatchDependencyScope(compositionWatchId(output.name), () =>
+        serializeOutputComposition(compose(output)),
+      );
     } catch (error) {
       console.error(`COMPOSITOR.rendering.composition failed for ${output.name}`, error);
       slot.plan = null;
@@ -4123,11 +4238,22 @@ function evaluateOutputComposition(
   outputCompositionVersion++;
 }
 
+function compositionWatchId(outputName: string): string {
+  return `composition:${outputName}`;
+}
+
+function disposeOutputCompositionSlot(name: string, slot: OutputCompositionSlot): void {
+  slot.dispose?.();
+  slot.dispose = null;
+  clearRuntimeWatchDependencies(compositionWatchId(name));
+}
+
 // `COMPOSITOR.effect.background_effect` as last sent to the compositor, and
 // whether one of the signals it read has changed since.
 let backgroundEffectWatch: (() => void) | undefined;
 let backgroundEffectConfig: RuntimeEffectConfig | undefined;
 let backgroundEffectDirty = false;
+const BACKGROUND_EFFECT_WATCH_ID = "background-effect";
 
 /**
  * Resolve the background effect's signals and watch them: the compositor reads
@@ -4149,7 +4275,10 @@ function resolveBackgroundEffect(
       return;
     }
     first = false;
-    resolved = (resolveSignals(config.background_effect) as CompiledEffectHandle | null) ?? null;
+    resolved = withRuntimeWatchDependencyScope(
+      BACKGROUND_EFFECT_WATCH_ID,
+      () => (resolveSignals(config.background_effect) as CompiledEffectHandle | null) ?? null,
+    );
   });
   return resolved;
 }
@@ -4165,8 +4294,8 @@ function publishBackgroundEffectIfChanged(publisher: EmbeddedRuntimeBridge): voi
 function publishOutputCompositionsIfChanged(publisher: EmbeddedRuntimeBridge): void {
   const config = COMPOSITOR.rendering?.composition;
   if (config !== outputCompositionConfig) {
-    for (const slot of outputCompositionSlots.values()) {
-      slot.dispose?.();
+    for (const [name, slot] of outputCompositionSlots) {
+      disposeOutputCompositionSlot(name, slot);
     }
     outputCompositionSlots.clear();
     outputCompositionConfig = config;
@@ -4182,7 +4311,9 @@ function publishOutputCompositionsIfChanged(publisher: EmbeddedRuntimeBridge): v
       const outputKey = JSON.stringify(output);
       let slot = outputCompositionSlots.get(output.name);
       if (!slot || slot.outputKey !== outputKey) {
-        slot?.dispose?.();
+        if (slot) {
+          disposeOutputCompositionSlot(output.name, slot);
+        }
         slot = { outputKey, dispose: null, dirty: true, plan: null };
         outputCompositionSlots.set(output.name, slot);
       }
@@ -4192,7 +4323,7 @@ function publishOutputCompositionsIfChanged(publisher: EmbeddedRuntimeBridge): v
     }
     for (const [name, slot] of outputCompositionSlots) {
       if (!seen.has(name)) {
-        slot.dispose?.();
+        disposeOutputCompositionSlot(name, slot);
         outputCompositionSlots.delete(name);
         outputCompositionVersion++;
       }

@@ -50,7 +50,7 @@ impl Drop for TestRuntimeDir {
 use rustyscript::{
     Module, Runtime, RuntimeOptions,
     deno_core::{
-        GarbageCollected, ModuleSource, ModuleSourceCode, ModuleSpecifier,
+        GarbageCollected, ModuleSource, ModuleSourceCode, ModuleSpecifier, OpState,
         error::ModuleLoaderError, extension, op2, v8,
     },
     json_args,
@@ -212,12 +212,34 @@ pub enum NativeInteractionRequest {
         #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
         input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
     },
+    PointerRegion {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        event: shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
+        display_state: Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
+        #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
+        input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
+    },
     InputGrab {
         #[serde(rename = "requestId")]
         request_id: u64,
         #[serde(rename = "grabId")]
         grab_id: u64,
         event: shojiwm_lib::runtime_input_grab::InputGrabEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
+        display_state: Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
+        #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
+        input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
+    },
+    Dnd {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        event: shojiwm_lib::dnd::DndEventSnapshot,
         #[serde(rename = "nowMs")]
         now_ms: u64,
         #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
@@ -422,7 +444,9 @@ pub enum NativeInteractionKind {
     PointerMoveAsync,
     GestureSwipe,
     GestureSwipeAsync,
+    PointerRegion,
     InputGrab,
+    Dnd,
     WindowMove,
     WindowResize,
 }
@@ -434,7 +458,9 @@ impl NativeInteractionKind {
             Self::PointerMoveAsync => "pointerMoveAsync",
             Self::GestureSwipe => "gestureSwipe",
             Self::GestureSwipeAsync => "gestureSwipeAsync",
+            Self::PointerRegion => "pointerRegion",
             Self::InputGrab => "inputGrab",
+            Self::Dnd => "dnd",
             Self::WindowMove => "windowMove",
             Self::WindowResize => "windowResize",
         }
@@ -553,6 +579,9 @@ struct WireNativeSurfacePolicy {
 struct WireNativeCompositionPatch {
     node_id: String,
     node: WireDecorationNode,
+    /// `node` is sent without children; the compositor's node keeps its own.
+    #[serde(default)]
+    keep_children: bool,
 }
 
 #[op2]
@@ -1589,9 +1618,16 @@ impl ShojiRuntimeBridge {
                                 ),
                             ));
                         }
-                        Ok(NativeCompositionPatch::ReplaceNode {
-                            node_id: patch.node_id,
-                            node,
+                        Ok(if patch.keep_children {
+                            NativeCompositionPatch::ReplaceProps {
+                                node_id: patch.node_id,
+                                node,
+                            }
+                        } else {
+                            NativeCompositionPatch::ReplaceNode {
+                                node_id: patch.node_id,
+                                node,
+                            }
                         })
                     })
                     .collect::<Result<Vec<_>, std::io::Error>>()?;
@@ -2287,7 +2323,9 @@ fn native_interaction_kind(value: &str) -> Result<NativeInteractionKind, std::io
         "pointerMoveAsync" => Ok(NativeInteractionKind::PointerMoveAsync),
         "gestureSwipe" => Ok(NativeInteractionKind::GestureSwipe),
         "gestureSwipeAsync" => Ok(NativeInteractionKind::GestureSwipeAsync),
+        "pointerRegion" => Ok(NativeInteractionKind::PointerRegion),
         "inputGrab" => Ok(NativeInteractionKind::InputGrab),
+        "dnd" => Ok(NativeInteractionKind::Dnd),
         "windowMove" => Ok(NativeInteractionKind::WindowMove),
         "windowResize" => Ok(NativeInteractionKind::WindowResize),
         _ => Err(std::io::Error::new(
@@ -2419,6 +2457,114 @@ fn set_pending_native_response(
     Ok(())
 }
 
+/// The host of the compositor this isolate serves. Kept in the isolate's op
+/// state rather than `WAKE_HOST`, which belongs to whichever runtime started last.
+fn isolate_host(state: &OpState) -> Option<shojiwm_lib::runtime_api::RuntimeHost> {
+    state
+        .try_borrow::<shojiwm_lib::runtime_api::RuntimeHost>()
+        .cloned()
+}
+
+/// `COMPOSITOR.cursor.setPosition`: sent like any other host side effect, so it works
+/// from key bindings, IPC handlers and timers alike.
+#[op2]
+fn op_shoji_cursor_set_position(
+    state: &mut OpState,
+    #[serde] target: shojiwm_lib::cursor::RuntimeCursorPositionTarget,
+) {
+    if let Some(host) = isolate_host(state) {
+        host.send(shojiwm_lib::runtime_api::HostMessage::CursorPosition(target));
+    }
+}
+
+/// `COMPOSITOR.cursor.getPosition`: the compositor publishes the cursor after every
+/// pointer motion, so this reads it without a round trip.
+#[op2]
+#[serde]
+fn op_shoji_cursor_position(
+    state: &mut OpState,
+) -> Option<shojiwm_lib::cursor::CursorPositionSnapshot> {
+    isolate_host(state)?.cursor_position()
+}
+
+/// `COMPOSITOR.cursor.overrideKind`: a CSS cursor name, `none` to hide the
+/// cursor, or `null` to give the cursor back to the clients.
+#[op2]
+fn op_shoji_cursor_override(
+    state: &mut OpState,
+    #[string] kind: Option<String>,
+) -> Result<(), std::io::Error> {
+    let kind = kind
+        .as_deref()
+        .map(shojiwm_lib::cursor::CursorOverride::parse)
+        .transpose()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if let Some(host) = isolate_host(state) {
+        host.send(shojiwm_lib::runtime_api::HostMessage::CursorOverride(kind));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum WireDragViewCommand {
+    #[serde(rename_all = "camelCase")]
+    Show {
+        view_id: u64,
+        drag_id: u64,
+        max_linger_ms: Option<f64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Props {
+        view_id: u64,
+        props: shojiwm_lib::dnd::DragViewProps,
+    },
+    #[serde(rename_all = "camelCase")]
+    Content {
+        view_id: u64,
+        tree: Option<WireDecorationNode>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Dispose { view_id: u64 },
+}
+
+/// `drag.show()` and its view's updates.
+#[op2]
+fn op_shoji_dnd_view(
+    state: &mut OpState,
+    #[serde] command: WireDragViewCommand,
+) -> Result<(), std::io::Error> {
+    use shojiwm_lib::dnd::DragViewCommand;
+    let command = match command {
+        WireDragViewCommand::Show {
+            view_id,
+            drag_id,
+            max_linger_ms,
+        } => DragViewCommand::Show {
+            view_id,
+            drag_id,
+            max_linger_ms: max_linger_ms
+                .filter(|ms| ms.is_finite())
+                .map(|ms| ms.max(0.0) as u64),
+        },
+        WireDragViewCommand::Props { view_id, props } => DragViewCommand::Props { view_id, props },
+        WireDragViewCommand::Content { view_id, tree } => DragViewCommand::Content {
+            view_id,
+            content: tree
+                .map(shojiwm_lib::ssd::DecorationNode::try_from)
+                .transpose()
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+                })?,
+        },
+        WireDragViewCommand::Dispose { view_id } => DragViewCommand::Dispose { view_id },
+    };
+    if let Some(host) = isolate_host(state) {
+        host.send(shojiwm_lib::runtime_api::HostMessage::DragView(command));
+    }
+    Ok(())
+}
+
 extension!(
     shoji_runtime_bridge,
     ops = [
@@ -2431,6 +2577,10 @@ extension!(
         op_shoji_wake_compositor,
         op_shoji_output_power,
         op_shoji_input_grab,
+        op_shoji_cursor_set_position,
+        op_shoji_cursor_position,
+        op_shoji_cursor_override,
+        op_shoji_dnd_view,
     ],
     objects = [
         ShojiRuntimeBridge,
@@ -2844,6 +2994,7 @@ impl EmbeddedRuntime {
         script_path: PathBuf,
         config_path: PathBuf,
         working_dir: Option<PathBuf>,
+        host: Option<shojiwm_lib::runtime_api::RuntimeHost>,
     ) -> Result<Self, String> {
         let bridge_id = NEXT_BRIDGE_ID.fetch_add(1, Ordering::Relaxed);
         let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2882,6 +3033,7 @@ impl EmbeddedRuntime {
                     &script_path,
                     &config_path,
                     working_dir.as_deref(),
+                    host,
                     &ready_tx,
                 );
                 shojiwm_lib::backend::overlay::close_owner(&overlay_owner_for_thread);
@@ -3145,6 +3297,7 @@ fn run_runtime(
     script_path: &PathBuf,
     config_path: &std::path::Path,
     working_dir: Option<&std::path::Path>,
+    host: Option<shojiwm_lib::runtime_api::RuntimeHost>,
     ready: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     #[cfg(test)]
@@ -3184,6 +3337,9 @@ fn run_runtime(
         ..Default::default()
     })
     .map_err(|error| format!("failed to create RustyScript runtime: {error}"))?;
+    if let Some(host) = host {
+        runtime.deno_runtime().op_state().borrow_mut().put(host);
+    }
 
     runtime
         .set_current_dir(&runtime_working_dir)

@@ -7,6 +7,7 @@ import type {
 } from "./types";
 import { isSignal } from "./signals";
 import {
+  clearWindowNodeSubtreeDependencies,
   enterWindowNodeDependencyScope,
   enterWindowShaderUniformDependencyScope,
   leaveWindowNodeDependencyScope,
@@ -97,22 +98,47 @@ export function patchSerializedCompositionTree(
   }
 
   const shouldReplaceSelf = dirtyNodeIds.has(path);
-  if (shouldReplaceSelf) {
+  if (shouldReplaceSelf && previous.kind !== node.type) {
+    clearWindowNodeSubtreeDependencies(path);
     return serializeElementNode(node, context, path);
   }
 
+  // A dirty node is serialized again, but only itself: its children are
+  // their own nodes with their own dependencies, and patched (or kept) on
+  // their own. Re-serializing the whole subtree made a change to a root prop
+  // (a window's shadow) cost as much as rebuilding the window.
+  let props = previous.props;
+  if (shouldReplaceSelf) {
+    enterWindowNodeDependencyScope(path);
+    try {
+      props = serializeProps(node.props, context, path, node.type);
+    } finally {
+      leaveWindowNodeDependencyScope();
+    }
+  }
+
+  const children = node.children.map((child, index) => {
+    const childPath = childNodePath(path, child, index);
+    const previousChild = previous.children[index];
+    if (previousChild === undefined) {
+      return serializeCompositionTree(child, context, childPath);
+    }
+    return patchSerializedCompositionTree(child, previousChild, dirtyNodeIds, context, childPath);
+  });
+  // An untouched subtree stays the same object, which tells the runtime a
+  // patched node's children did not change (it then sends the node alone).
+  if (
+    !shouldReplaceSelf &&
+    children.length === previous.children.length &&
+    children.every((child, index) => child === previous.children[index])
+  ) {
+    return previous;
+  }
   return {
     kind: previous.kind,
     nodeId: previous.nodeId,
-    props: previous.props,
-    children: node.children.map((child, index) => {
-      const childPath = childNodePath(path, child, index);
-      const previousChild = previous.children[index];
-      if (previousChild === undefined) {
-        return serializeCompositionTree(child, context, childPath);
-      }
-      return patchSerializedCompositionTree(child, previousChild, dirtyNodeIds, context, childPath);
-    }),
+    props,
+    children,
   };
 }
 
@@ -314,15 +340,21 @@ function serializeShaderUniformContainer(
       nested as Record<string, unknown>,
     )) {
       const bindingKey = shaderUniformBindingKey(nodeId, stageIndex, name);
-      context?.registerShaderUniformBinding({
-        key: bindingKey,
-        nodeId,
-        stageIndex,
-        name,
-        read: () => readNumericShaderUniform(uniform),
-      });
+      // Registering reads the uniform's first value. For a computed that read
+      // runs its body, so it must happen in the uniform's scope too: in the
+      // node's, the signals the computed reads (a window rect, say) became node
+      // dependencies, and every change of them re-patched the node instead of
+      // patching the uniform — a full rebuild while a layout animation
+      // suppresses SSD rebuilds.
       enterWindowShaderUniformDependencyScope(bindingKey, nodeId);
       try {
+        context?.registerShaderUniformBinding({
+          key: bindingKey,
+          nodeId,
+          stageIndex,
+          name,
+          read: () => readNumericShaderUniform(uniform),
+        });
         uniforms[name] = serializeValue(uniform);
       } finally {
         leaveWindowShaderUniformDependencyScope();

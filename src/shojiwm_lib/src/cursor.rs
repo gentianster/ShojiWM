@@ -21,6 +21,62 @@ pub struct RuntimeCursorConfigUpdate {
     pub reload: bool,
 }
 
+/// `COMPOSITOR.cursor.setPosition`: where to move the cursor.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum RuntimeCursorPositionTarget {
+    /// A point on `output`, placed like a pointer region's anchor.
+    Output {
+        output: String,
+        #[serde(default = "center_anchor")]
+        anchor: crate::runtime_pointer_region::PointerRegionAnchor,
+        #[serde(default)]
+        offset: crate::runtime_pointer_region::PointerRegionOffset,
+    },
+    /// Global logical coordinates in the output layout.
+    Global { x: f64, y: f64 },
+}
+
+/// `COMPOSITOR.cursor.overrideKind`: the cursor shown everywhere, whatever
+/// the client under the pointer asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOverride {
+    Named(CursorIcon),
+    Hidden,
+}
+
+impl CursorOverride {
+    /// A CSS cursor name, or `none` to hide the cursor.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        if name == "none" {
+            return Ok(Self::Hidden);
+        }
+        name.parse::<CursorIcon>()
+            .map(Self::Named)
+            .map_err(|_| format!("unknown cursor kind: {name:?}"))
+    }
+
+    pub fn status(self) -> smithay::input::pointer::CursorImageStatus {
+        match self {
+            Self::Named(icon) => smithay::input::pointer::CursorImageStatus::Named(icon),
+            Self::Hidden => smithay::input::pointer::CursorImageStatus::Hidden,
+        }
+    }
+}
+
+fn center_anchor() -> crate::runtime_pointer_region::PointerRegionAnchor {
+    crate::runtime_pointer_region::PointerRegionAnchor::Center
+}
+
+/// `COMPOSITOR.cursor.getPosition`: the cursor as of the last pointer motion.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorPositionSnapshot {
+    pub x: f64,
+    pub y: f64,
+    pub output_name: Option<String>,
+}
+
 impl Cursor {
     pub fn load() -> Self {
         let name = std::env::var("XCURSOR_THEME")

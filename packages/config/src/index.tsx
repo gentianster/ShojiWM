@@ -14,6 +14,7 @@ import {
   dualKawaseBlur,
   type SSDStyle,
   type WaylandWindow,
+  type WindowDecorationState,
   computed,
   useState,
   shaderStage,
@@ -50,6 +51,8 @@ import {
 import { ISLAND_GLASS } from "./effect/island-glass";
 import { createFlip3D } from "./flip-3d";
 import { createWindowGrid } from "./window-grid";
+import { installDragAndDrop } from "./drag-and-drop";
+import type { TitlebarButton } from "./window-switcher";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
@@ -92,7 +95,13 @@ const WINDOW_SWITCHER = (
     window.state[WINDOW_STATE_FULLSCREEN]()
       ? FULLSCREEN_Z_INDEX
       : windowZIndex(window),
+  // The grid's selected card: its title bar buttons work.
+  titlebarButtonAt,
 });
+
+// Drag and drop: the dragged image on a card with the action and the kind of
+// data, flying back when a drop is refused (./drag-and-drop.tsx).
+installDragAndDrop();
 COMPOSITOR.rendering.composition = (output) =>
   WINDOW_SWITCHER.compose(output) ?? <DefaultComposition />;
 
@@ -416,9 +425,10 @@ function toggleLauncher() {
   });
 }
 COMPOSITOR.key.bind("launcher", "Super+A", toggleLauncher);
-// Super tap (fires on release only, when no other key/button was pressed in between).
+// Super tap: fires on a quick release (within 300 ms) with no other key/button pressed in between.
 COMPOSITOR.key.bind("launcher-tap", "Super", toggleLauncher, {
   on: "release",
+  within: 300,
 });
 // The same launcher panel with its field pointed at the clipboard's history.
 function toggleClipboard() {
@@ -803,6 +813,7 @@ COMPOSITOR.event.onWindowResize((event) => {
 
 COMPOSITOR.pointer.bindWindowMoveModifier("Super");
 COMPOSITOR.pointer.bindWindowResizeModifier("Super");
+COMPOSITOR.cursor.bindAppLockIgnoreModifier("Super");
 
 COMPOSITOR.event.onWindowMove((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMove(event);
@@ -825,24 +836,44 @@ COMPOSITOR.event.onWindowActivateRequest((event) => {
   scheduleWorkspaceBroadcast();
 });
 
-function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
-  const client = window.position;
-  return {
-    x: client.x - WINDOW_BORDER_PX,
-    y: client.y - TITLEBAR_HEIGHT - WINDOW_BORDER_PX,
-    width: client.width + WINDOW_BORDER_PX * 2,
-    height: client.height + TITLEBAR_HEIGHT + WINDOW_BORDER_PX * 2,
-  };
-}
-
-COMPOSITOR.window.composition = (window: WaylandWindow) => {
-  const decoration = window.decoration();
-  const useClientDecoration =
+function usesClientDecoration(decoration: WindowDecorationState): boolean {
+  return (
     decoration.mode === "client" &&
     !(
       decoration.clientPreference === "server" &&
       decoration.configuredMode === "server"
-    );
+    )
+  );
+}
+
+// Must match the frame the composition below draws: a client-decorated window
+// gets only the border, so counting the title bar would size its client 30px
+// past what the layout meant (and past the client's own maximum). The border
+// is drawn for both, so it is counted for both; a config that drops the
+// border for client-decorated windows must drop WINDOW_BORDER_PX here too.
+function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
+  const client = window.position;
+  const titlebar = usesClientDecoration(window.decoration.peek())
+    ? 0
+    : TITLEBAR_HEIGHT;
+  return {
+    x: client.x - WINDOW_BORDER_PX,
+    y: client.y - titlebar - WINDOW_BORDER_PX,
+    width: client.width + WINDOW_BORDER_PX * 2,
+    height: client.height + titlebar + WINDOW_BORDER_PX * 2,
+  };
+}
+
+/**
+ * The title bar's button size, padding and gap. `titlebarButtonAt` finds the
+ * buttons with the same numbers, so change them here.
+ */
+const TITLEBAR_BUTTON_SIZE = 16;
+const TITLEBAR_PADDING_X = 8;
+const TITLEBAR_GAP = 8;
+
+COMPOSITOR.window.composition = (window: WaylandWindow) => {
+  const useClientDecoration = usesClientDecoration(window.decoration());
   const workspaceVisible = window.state[WINDOW_STATE_WORKSPACE_VISIBLE];
   const workspaceOffsetY = window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y];
   const workspaceOpacity = window.state[WINDOW_STATE_WORKSPACE_OPACITY];
@@ -891,8 +922,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
 
   const titlebarStyle: SSDStyle = {
     height: TITLEBAR_HEIGHT,
-    paddingX: 8,
-    gap: 8,
+    paddingX: TITLEBAR_PADDING_X,
+    gap: TITLEBAR_GAP,
     alignItems: "center",
     background: titlebarBackground,
   };
@@ -1092,6 +1123,35 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   );
 };
 
+/**
+ * The title bar button at `(x, y)`, logical px from the top-left corner of
+ * `window.rect` (the frame: border, then the title bar). From the right:
+ * close, maximize, minimize. Each button takes the whole title bar height
+ * and half the gap on both sides, so a scaled-down card still has a usable
+ * target.
+ */
+function titlebarButtonAt(window: WaylandWindow, x: number, y: number): TitlebarButton | null {
+  if (
+    window.state[WINDOW_STATE_FULLSCREEN].peek() ||
+    usesClientDecoration(window.decoration.peek())
+  ) {
+    return null;
+  }
+  if (y < WINDOW_BORDER_PX || y > WINDOW_BORDER_PX + TITLEBAR_HEIGHT) {
+    return null;
+  }
+  const buttons: TitlebarButton[] = ["close", "maximize", "minimize"];
+  const pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_GAP;
+  const right = window.rect.width - WINDOW_BORDER_PX - TITLEBAR_PADDING_X;
+  for (let i = 0; i < buttons.length; i++) {
+    const center = right - TITLEBAR_BUTTON_SIZE / 2 - i * pitch;
+    if (Math.abs(x - center) <= pitch / 2) {
+      return buttons[i];
+    }
+  }
+  return null;
+}
+
 const CloseButton = ({ window }: { window: WaylandWindow }) => {
   const [hover, setHover] = useState(false);
 
@@ -1103,8 +1163,8 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
       <Image
         src="./assets/x.svg"
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           position: "absolute",
           zIndex: 1,
           pointerEvents: "none",
@@ -1118,8 +1178,8 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
       <Button
         onHoverChange={setHover}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           borderRadius: 8,
           background: "#FFFFFF20",
           border: { px: 1, color: borderColor },
@@ -1194,8 +1254,8 @@ const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
       <Image
         src={src}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           position: "absolute",
           zIndex: 1,
           pointerEvents: "none",
@@ -1209,8 +1269,8 @@ const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
       <Button
         onHoverChange={setHover}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           borderRadius: 8,
           background: "#FFFFFF20",
           border: { px: 1, color: borderColor },
@@ -1250,8 +1310,8 @@ const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
       <Image
         src="./assets/minus.svg"
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           position: "absolute",
           zIndex: 1,
           pointerEvents: "none",
@@ -1265,8 +1325,8 @@ const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
       <Button
         onHoverChange={setHover}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           borderRadius: 8,
           background: "#FFFFFF20",
           border: { px: 1, color: borderColor },

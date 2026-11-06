@@ -374,12 +374,38 @@ fn apply_cached_tree_update(
                         *target = node;
                         changed = true;
                     }
+                    CompositionPatch::ReplaceProps { node, .. } => {
+                        // Compared and swapped without the children, which stay.
+                        let children = std::mem::take(&mut target.children);
+                        if *target != node {
+                            layout_equivalent &= target.layout_equivalent(&node);
+                            *target = node;
+                            changed = true;
+                        }
+                        target.children = children;
+                    }
                     CompositionPatch::ShaderUniform {
                         stage_index,
                         name,
                         value,
                         ..
                     } => {
+                        // A paint / overlay shader's uniform, on any node kind. These arrive
+                        // next to node patches when a turn changed both.
+                        if let Some(slot) = paint_slot_for_stage(stage_index) {
+                            validate_paint_uniform(&target.style, slot, &node_id, &name, &value)?;
+                            let shader = paint_shader_mut(&mut target.style, slot)
+                                .expect("paint uniform was validated");
+                            let current = shader
+                                .uniforms
+                                .get_mut(&name)
+                                .expect("paint uniform was validated");
+                            if *current != value {
+                                *current = value;
+                                changed = true;
+                            }
+                            continue;
+                        }
                         let super::DecorationNodeKind::ShaderEffect(effect) = &mut target.kind
                         else {
                             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
@@ -883,6 +909,21 @@ impl WindowDecorationState {
         self.layout.hit_test_at(point.x, point.y)
     }
 
+    /// Whether global `pos` lies in the `<WindowBorder>` resize band outside
+    /// the frame (see `DecorationLayout::resize_hit_outset`).
+    pub fn resize_band_contains(&self, pos: Point<f64, Logical>) -> bool {
+        if self.layout.resize_hit_outset() <= 0.0 {
+            return false;
+        }
+        let local = inverse_transform_point(pos, self.layout.root.rect, self.visual_transform);
+        let root = self.layout.root.rect;
+        let inside_root = local.x >= root.x as f64
+            && local.y >= root.y as f64
+            && local.x < (root.x + root.width) as f64
+            && local.y < (root.y + root.height) as f64;
+        !inside_root && matches!(self.hit_test(local), DecorationHitTestResult::Resize(_))
+    }
+
     /// The open `<Popup>`s, which the backends draw in their own pass.
     pub fn popup_scopes(&self) -> super::PopupScopes {
         super::PopupScopes::of(&self.layout.root)
@@ -1223,6 +1264,7 @@ impl ShojiWM {
             self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
+                &invocation.dirty_window_node_ids,
             );
             self.request_tty_maintenance("runtime-window-resize-dirty");
             self.schedule_redraw();
@@ -1266,6 +1308,7 @@ impl ShojiWM {
             self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
+                &invocation.dirty_window_node_ids,
             );
             self.request_tty_maintenance("runtime-window-move-dirty");
             self.schedule_redraw();
@@ -1392,6 +1435,7 @@ impl ShojiWM {
             self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
+                &invocation.dirty_window_node_ids,
             );
             self.request_tty_maintenance(reason);
             self.schedule_redraw();
@@ -1591,6 +1635,7 @@ impl ShojiWM {
         self.mark_runtime_dirty_windows(
             invocation.dirty_window_ids,
             invocation.dirty_managed_window_ids,
+            &invocation.dirty_window_node_ids,
         );
         self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
         self.apply_runtime_window_actions(invocation.actions);
@@ -2985,6 +3030,9 @@ impl ShojiWM {
                             {
                                 return Ok(cached.client_rect);
                             }
+                            if let Some(rect) = managed_client_rect_for_move(cached) {
+                                return Ok(rect);
+                            }
                             managed_client_rect_for_state(
                                 &cached.tree,
                                 &cached.managed_window,
@@ -2995,6 +3043,21 @@ impl ShojiWM {
                         .transpose()?
                         .unwrap_or(client_rect)
                 };
+                // The probe above ran against the cached tree, managed rect and
+                // scale. Once it agrees with the cached rect and no Rust-side
+                // animation is moving the window, the cache is coherent again;
+                // otherwise a window whose animation ended without a relayout
+                // (an opacity fade, a rect animation landing on the cached
+                // rect) would run the probe loop on every redraw for good.
+                if let Some(cached) = self.window_decorations.get_mut(&window) {
+                    if client_rect_probe_restores_coherence(
+                        cached,
+                        layout_scale,
+                        cached_effective_client_rect,
+                    ) {
+                        cached.client_rect_potentially_stale = false;
+                    }
+                }
                 let had_cached_decoration = {
                     timescope::scope!("ssd window cache lookup");
                     self.window_decorations.contains_key(&window)
@@ -3016,8 +3079,12 @@ impl ShojiWM {
                     (runtime_state_changed, snapshot_changed)
                 };
 
+                // Not `force_output_animation_reevaluate`: a runtime animation steps
+                // through signals, so the scheduler tick reports the windows it moves.
+                // Forcing every window of the output too re-evaluated all of them on
+                // each frame of any one window's animation (a focus fade), and kept
+                // moving windows off the translate fast path below.
                 let runtime_dirty = force_runtime_reevaluate
-                    || force_output_animation_reevaluate
                     || runtime_state_changed
                     || window_was_runtime_dirty;
                 let force_full_cached_reevaluation = force_runtime_reevaluate
@@ -3547,6 +3614,30 @@ impl ShojiWM {
                         }
                         pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                         if evaluation.managed_window_only {
+                            if force_async_asset_refresh {
+                                // Text and icons rasterize asynchronously, and the
+                                // refresh after they arrive is the only one that picks
+                                // them up. A managed-window-only update (a window
+                                // animating open, say) must not skip it, or the labels
+                                // and icons stay blank until something relayouts the
+                                // window.
+                                let order_map = build_render_order_map(&cached.layout);
+                                let previous_text_buffers = cached.text_buffers.clone();
+                                cached.text_buffers = build_text_buffers_with_fallback(
+                                    &cached.layout,
+                                    &order_map,
+                                    window_raster_scale,
+                                    &mut self.text_rasterizer,
+                                    &previous_text_buffers,
+                                );
+                                cached.icon_buffers = build_icon_buffers(
+                                    &cached.layout,
+                                    &order_map,
+                                    window_raster_scale,
+                                    &cached.snapshot,
+                                    &mut self.icon_rasterizer,
+                                );
+                            }
                             if runtime_dirty_debug_enabled() {
                                 info!(
                                     window_id = %snapshot_id,
@@ -4834,7 +4925,7 @@ impl ShojiWM {
             .retain(|window_id| live_window_ids.contains(window_id));
         self.runtime_poll_dirty = !self.runtime_dirty_window_ids.is_empty();
         self.async_asset_dirty = false;
-        self.sync_wlr_foreign_toplevel_states();
+        self.sync_taskbar_window_states();
         self.sync_popup_dismissals();
 
         Ok(())
@@ -4862,9 +4953,9 @@ impl ShojiWM {
             let logical_point = LogicalPoint::new(point.x.floor() as i32, point.y.floor() as i32);
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
-            if !transformed_root.contains(logical_point)
-                || !self.client_input_region_accepts(window, Some(decoration), point)
-            {
+            let inside = transformed_root.contains(logical_point)
+                && self.client_input_region_accepts(window, Some(decoration), point);
+            if !inside && !decoration.resize_band_contains(point) {
                 return None;
             }
             let local_point = inverse_transform_point(
@@ -4910,7 +5001,10 @@ impl ShojiWM {
             if !transformed_root.contains(logical_point)
                 || !self.client_input_region_accepts(window, Some(decoration), point)
             {
-                return None;
+                // The resize band ends the search: nothing below it is hovered.
+                return decoration
+                    .resize_band_contains(point)
+                    .then(|| (window.clone(), Vec::new()));
             }
             let local_point = inverse_transform_point(
                 point,
@@ -6064,6 +6158,40 @@ fn managed_client_rect_for_state(
     managed_client_rect_for_root(tree, desired_root, scale)
 }
 
+/// Whether a probe of `managed_client_rect_for_state` that just ran against
+/// the cached tree, managed rect and scale lets the refresh trust
+/// `cached.client_rect` again (see `client_rect_potentially_stale`).
+fn client_rect_probe_restores_coherence(
+    cached: &WindowDecorationState,
+    layout_scale: f64,
+    probed_client_rect: LogicalRect,
+) -> bool {
+    client_rect_probe_agrees(
+        cached.client_rect_potentially_stale,
+        cached.managed_window_animation_active,
+        cached.layout_scale,
+        layout_scale,
+        cached.client_rect,
+        probed_client_rect,
+    )
+}
+
+fn client_rect_probe_agrees(
+    stale: bool,
+    animation_active: bool,
+    cached_scale: f64,
+    layout_scale: f64,
+    cached_client_rect: LogicalRect,
+    probed_client_rect: LogicalRect,
+) -> bool {
+    // A running animation moves the managed rect again before the next
+    // refresh; a scale change relayouts first.
+    stale
+        && !animation_active
+        && cached_scale == layout_scale
+        && cached_client_rect == probed_client_rect
+}
+
 /// Whether `managed_client_rect_for_state` derives the rect from the
 /// managed rect alone, without reading its fallback client rect.
 fn managed_client_rect_ignores_fallback(managed: &super::ManagedWindowState) -> bool {
@@ -6072,6 +6200,22 @@ fn managed_client_rect_ignores_fallback(managed: &super::ManagedWindowState) -> 
         && managed.rect.is_some_and(|rect| {
             let rect = managed_rect_snapshot_to_logical_rect(rect);
             rect.width > 0 && rect.height > 0
+        })
+}
+
+/// `managed_client_rect_for_state` for a managed rect that only moved: at the size the
+/// cached layout was computed for, the probe lands on that layout's insets, so they are
+/// taken from it instead of probing. A Rust rect animation moving every tile of a
+/// scrolled workspace otherwise ran the probe loop for each of them on every frame.
+fn managed_client_rect_for_move(cached: &WindowDecorationState) -> Option<LogicalRect> {
+    if !managed_client_rect_ignores_fallback(&cached.managed_window) {
+        return None;
+    }
+    let desired_root = managed_rect_snapshot_to_logical_rect(cached.managed_window.rect?);
+    let current_root = cached.layout.root.rect;
+    (desired_root.width == current_root.width && desired_root.height == current_root.height)
+        .then(|| {
+            managed_client_rect_from_current_insets(current_root, cached.client_rect, desired_root)
         })
 }
 
@@ -6658,9 +6802,92 @@ fn build_icon_buffers(
         order_map,
         &node_geometry,
         raster_scale,
-        snapshot,
+        snapshot.into(),
         rasterizer,
     )
+}
+
+/// Where `<AppIcon>` takes its picture from.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IconSource<'a> {
+    pub icon: Option<&'a super::WindowIconSnapshot>,
+    pub app_id: Option<&'a str>,
+}
+
+impl<'a> From<&'a WaylandWindowSnapshot> for IconSource<'a> {
+    fn from(snapshot: &'a WaylandWindowSnapshot) -> Self {
+        Self {
+            icon: snapshot.icon.as_ref(),
+            app_id: snapshot.app_id.as_deref(),
+        }
+    }
+}
+
+/// A decoration tree drawn for no window (a drag view, see `crate::dnd`),
+/// laid out at one scale, with the buffers to draw it.
+#[derive(Debug)]
+pub(crate) struct StandaloneDecoration {
+    pub layout: ComputedDecorationTree,
+    pub buffers: Vec<CachedDecorationBuffer>,
+    /// `<ShaderEffect>` nodes.
+    pub shader_buffers: Vec<CachedShaderEffect>,
+    pub shader_cache:
+        std::collections::HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
+    pub text_buffers: Vec<CachedDecorationLabel>,
+    pub icon_buffers: Vec<CachedDecorationIcon>,
+    pub paint_cache: std::collections::HashMap<String, PaintElementState>,
+}
+
+impl StandaloneDecoration {
+    /// Lay `tree` out at `scale` and rasterize its labels and images.
+    /// `previous` lends its paint element states (stable element ids, so an
+    /// unchanged paint item is not redrawn) and its labels (shown until a new
+    /// label is rasterized).
+    pub(crate) fn build(
+        tree: &DecorationTree,
+        slot_size: Option<(i32, i32)>,
+        scale: f64,
+        source: IconSource<'_>,
+        text_rasterizer: &mut crate::backend::text::TextRasterizer,
+        icon_rasterizer: &mut crate::backend::icon::IconRasterizer,
+        previous: Option<Self>,
+    ) -> Result<Self, super::DecorationLayoutError> {
+        let layout = tree.layout_standalone(slot_size, scale)?;
+        let order_map = build_render_order_map(&layout);
+        let buffers = build_cached_buffers(&layout, &order_map);
+        let shader_buffers = build_shader_buffers(&layout, &order_map);
+        let text_buffers = build_text_buffers_with_fallback(
+            &layout,
+            &order_map,
+            scale,
+            text_rasterizer,
+            previous
+                .as_ref()
+                .map(|previous| previous.text_buffers.as_slice())
+                .unwrap_or_default(),
+        );
+        let node_geometry = build_node_geometry_map(&layout);
+        let icon_buffers = build_icon_buffers_with_node_geometry(
+            &layout,
+            &order_map,
+            &node_geometry,
+            scale,
+            source,
+            icon_rasterizer,
+        );
+        let (paint_cache, shader_cache) = previous
+            .map(|previous| (previous.paint_cache, previous.shader_cache))
+            .unwrap_or_default();
+        Ok(Self {
+            layout,
+            buffers,
+            shader_buffers,
+            shader_cache,
+            text_buffers,
+            icon_buffers,
+            paint_cache,
+        })
+    }
 }
 
 fn build_icon_buffers_with_node_geometry(
@@ -6668,7 +6895,7 @@ fn build_icon_buffers_with_node_geometry(
     order_map: &std::collections::HashMap<String, usize>,
     node_geometry: &impl NodeGeometryLookup,
     raster_scale: f64,
-    snapshot: &WaylandWindowSnapshot,
+    source: IconSource<'_>,
     rasterizer: &mut crate::backend::icon::IconRasterizer,
 ) -> Vec<CachedDecorationIcon> {
     let mut buffers = Vec::new();
@@ -6679,7 +6906,7 @@ fn build_icon_buffers_with_node_geometry(
         None,
         node_geometry,
         raster_scale,
-        snapshot,
+        source,
         rasterizer,
         &mut buffers,
     );
@@ -6818,7 +7045,7 @@ fn collect_retargeted_icon_buffers(
 
     if !matches!(
         node.kind,
-        super::DecorationNodeKind::AppIcon | super::DecorationNodeKind::Image(_)
+        super::DecorationNodeKind::AppIcon(_) | super::DecorationNodeKind::Image(_)
     ) {
         return;
     }
@@ -6855,7 +7082,7 @@ fn collect_retargeted_icon_buffers(
     buffer.clip_rect_precise = clip_rect_precise;
     buffer.clip_radius_precise = clip_radius_precise;
 
-    if matches!(node.kind, super::DecorationNodeKind::AppIcon)
+    if matches!(&node.kind, super::DecorationNodeKind::AppIcon(icon) if icon.fallback.is_none())
         && snapshot.icon.is_none()
         && snapshot.app_id.is_none()
     {
@@ -6954,7 +7181,7 @@ fn rebuild_partial_icon_buffers(
         Some(&dirty_node_ids),
         &node_geometry,
         raster_scale,
-        snapshot,
+        snapshot.into(),
         rasterizer,
         &mut buffers,
     );
@@ -7165,7 +7392,7 @@ fn collect_render_orders(
 
     match &node.kind {
         super::DecorationNodeKind::Label(_) => push("label".into(), order),
-        super::DecorationNodeKind::AppIcon | super::DecorationNodeKind::Image(_) => {
+        super::DecorationNodeKind::AppIcon(_) | super::DecorationNodeKind::Image(_) => {
             push("icon".into(), order)
         }
         _ => {}
@@ -7380,6 +7607,7 @@ fn collect_text_buffers(
         font_weight: node.style.font_weight.clone(),
         font_family: node.style.font_family.clone(),
         text_align: node.style.text_align.clone(),
+        text_overflow: node.style.text_overflow.clone(),
         line_height: node.style.line_height.map(|value| value as f32),
         raster_scale,
     };
@@ -7588,7 +7816,7 @@ fn collect_icon_buffers(
     dirty_node_ids: Option<&std::collections::HashSet<&str>>,
     node_geometry: &impl NodeGeometryLookup,
     raster_scale: f64,
-    snapshot: &WaylandWindowSnapshot,
+    source: IconSource<'_>,
     rasterizer: &mut crate::backend::icon::IconRasterizer,
     buffers: &mut Vec<CachedDecorationIcon>,
 ) {
@@ -7604,7 +7832,7 @@ fn collect_icon_buffers(
             dirty_node_ids,
             node_geometry,
             raster_scale,
-            snapshot,
+            source,
             rasterizer,
             buffers,
         );
@@ -7619,9 +7847,11 @@ fn collect_icon_buffers(
         return;
     }
 
-    let (asset_path, image_fit) = match &node.kind {
-        super::DecorationNodeKind::AppIcon => (None, None),
-        super::DecorationNodeKind::Image(image) => (Some(image.src.clone()), Some(image.fit)),
+    let (asset_path, image_fit, fallback_asset_path) = match &node.kind {
+        super::DecorationNodeKind::AppIcon(icon) => (None, None, icon.fallback.clone()),
+        super::DecorationNodeKind::Image(image) => {
+            (Some(image.src.clone()), Some(image.fit), None)
+        }
         _ => return,
     };
     let shared_geometry = node
@@ -7636,10 +7866,11 @@ fn collect_icon_buffers(
                 .map(|geometry| geometry.rect_precise)
                 .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
         ),
-        icon: snapshot.icon.clone(),
-        app_id: snapshot.app_id.clone(),
+        icon: source.icon.cloned(),
+        app_id: source.app_id.map(str::to_owned),
         asset_path,
         image_fit,
+        fallback_asset_path,
         raster_scale,
     };
 
@@ -7675,7 +7906,7 @@ fn node_kind_name(kind: &super::DecorationNodeKind) -> &'static str {
         super::DecorationNodeKind::Box(_) => "box",
         super::DecorationNodeKind::Label(_) => "label",
         super::DecorationNodeKind::Button(_) => "button",
-        super::DecorationNodeKind::AppIcon => "app-icon",
+        super::DecorationNodeKind::AppIcon(_) => "app-icon",
         super::DecorationNodeKind::Image(_) => "image",
         super::DecorationNodeKind::ShaderEffect(_) => "shader-effect",
         super::DecorationNodeKind::WindowBorder => "window-border",
@@ -8800,6 +9031,63 @@ mod tests {
     }
 
     #[test]
+    fn cached_tree_patch_updates_paint_uniform_next_to_node_patches() {
+        let mut uniforms = std::collections::BTreeMap::new();
+        uniforms.insert("hover".into(), crate::ssd::ShaderUniformValue::Float(0.0));
+        let mut button = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Row,
+        }));
+        button.stable_id = Some("root.Button[0]".into());
+        button.style.paint = Some(crate::ssd::PaintShader {
+            shader: crate::ssd::ShaderModule {
+                path: "button.frag".into(),
+            },
+            uniforms,
+            outsets: Default::default(),
+        });
+        let mut label = DecorationNode::new(DecorationNodeKind::Label(super::super::LabelNode {
+            text: "before".into(),
+        }));
+        label.stable_id = Some("root.Label[1]".into());
+        let mut root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Row,
+        }))
+        .with_children(vec![button, label]);
+        root.stable_id = Some("root".into());
+        let mut tree = DecorationTree::new(root);
+
+        let mut replacement =
+            DecorationNode::new(DecorationNodeKind::Label(super::super::LabelNode {
+                text: "after".into(),
+            }));
+        replacement.stable_id = Some("root.Label[1]".into());
+        let update = apply_cached_tree_update(
+            &mut tree,
+            None,
+            vec![
+                CompositionPatch::ReplaceNode {
+                    node_id: "root.Label[1]".into(),
+                    node: replacement,
+                },
+                CompositionPatch::ShaderUniform {
+                    node_id: "root.Button[0]".into(),
+                    stage_index: PAINT_STAGE_INDEX,
+                    name: "hover".into(),
+                    value: crate::ssd::ShaderUniformValue::Float(1.0),
+                },
+            ],
+        )
+        .expect("a paint uniform patch should apply next to node patches");
+
+        assert!(update.changed);
+        let paint = tree.root.children[0].style.paint.as_ref().expect("paint kept");
+        assert_eq!(
+            paint.uniforms.get("hover"),
+            Some(&crate::ssd::ShaderUniformValue::Float(1.0))
+        );
+    }
+
+    #[test]
     fn shader_uniform_update_targets_shader_input() {
         let mut uniforms = std::collections::BTreeMap::new();
         uniforms.insert(
@@ -9010,6 +9298,21 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn client_rect_probe_clears_staleness_once_animations_are_done() {
+        let rect = LogicalRect::new(10, 40, 640, 480);
+        let moved = LogicalRect::new(12, 40, 640, 480);
+        // An opacity fade ended without a relayout: the probe agrees with the
+        // cached rect, so the next refreshes can skip it.
+        assert!(client_rect_probe_agrees(true, false, 1.5, 1.5, rect, rect));
+        // Still animating, rescaled, or the rect really moved: keep probing.
+        assert!(!client_rect_probe_agrees(true, true, 1.5, 1.5, rect, rect));
+        assert!(!client_rect_probe_agrees(true, false, 1.0, 1.5, rect, rect));
+        assert!(!client_rect_probe_agrees(true, false, 1.5, 1.5, rect, moved));
+        // Nothing to restore.
+        assert!(!client_rect_probe_agrees(false, false, 1.5, 1.5, rect, rect));
     }
 
     #[test]

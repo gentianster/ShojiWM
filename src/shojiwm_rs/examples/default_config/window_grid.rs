@@ -12,6 +12,8 @@
 //! - like Alt+Tab, holding `Super` and pressing `Tab` (or an arrow key) switches
 //!   when `Super` goes up; a quick `Super+Tab` just opens the grid
 //! - `Escape` returns to the desktop unchanged
+//! - the selected card's title bar buttons minimize, maximize or close its
+//!   window, and a middle click closes a window; the other cards make room
 
 use std::cell::RefCell;
 
@@ -58,7 +60,20 @@ impl SwitcherLayout for WindowGrid {
             navigated_with_super: false,
         })
     }
+
+    // The selected card's title bar buttons work; a minimized window stays
+    // as a dimmed card.
+    fn card_actions(&self) -> bool {
+        true
+    }
+
+    fn minimized_opacity(&self) -> f64 {
+        0.5
+    }
 }
+
+/// What the grid was laid out for: the area and every window's size.
+type CellsKey = (Rect, Vec<(f64, f64)>);
 
 /// A window's place in the grid (logical px from the output's top-left corner).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,8 +86,8 @@ struct Cell {
 
 struct GridSession {
     windows: Vec<Window>,
-    /// The grid for the last area it was laid out in.
-    cells: RefCell<(Option<Rect>, Vec<Cell>)>,
+    /// The grid for the last area and window sizes it was laid out for.
+    cells: RefCell<(Option<CellsKey>, Vec<Cell>)>,
     /// `Tab` or an arrow key went down while `Super` was held.
     navigated_with_super: bool,
 }
@@ -80,17 +95,20 @@ struct GridSession {
 impl GridSession {
     fn cell(&self, index: usize, viewport: &Viewport) -> Cell {
         let area = grid_area(viewport);
+        // Windows can change size while shown (a tile making room): lay out again.
+        let sizes: Vec<(f64, f64)> = self
+            .windows
+            .iter()
+            .map(|window| {
+                let rect = window.rect();
+                (rect.width, rect.height)
+            })
+            .collect();
+        let key = (area, sizes);
         let mut cells = self.cells.borrow_mut();
-        if cells.0 != Some(area) {
-            let sizes: Vec<(f64, f64)> = self
-                .windows
-                .iter()
-                .map(|window| {
-                    let rect = window.rect();
-                    (rect.width, rect.height)
-                })
-                .collect();
-            *cells = (Some(area), layout_grid(&sizes, area));
+        if cells.0.as_ref() != Some(&key) {
+            let grid = layout_grid(&key.1, area);
+            *cells = (Some(key), grid);
         }
         cells.1[index]
     }
@@ -155,13 +173,18 @@ impl LayoutSession for GridSession {
         if event.source != "wheel" {
             return SwitcherAction::None;
         }
-        let clicks = event.discrete_y.unwrap_or(event.delta_y.signum() * 120.0) / 120.0;
-        let steps = clicks.signum() as i64 * clicks.abs().round().max(1.0) as i64;
+        let clicks = event.discrete_y.unwrap_or(sign(event.delta_y) * 120.0) / 120.0;
+        let steps = sign(clicks) as i64 * clicks.abs().round().max(1.0) as i64;
         self.select(selected + steps)
     }
 
     fn on_click_outside(&mut self) -> SwitcherAction {
         SwitcherAction::Cancel
+    }
+
+    fn windows_changed(&mut self, windows: &[Window]) {
+        self.windows = windows.to_vec();
+        *self.cells.get_mut() = (None, Vec::new());
     }
 }
 
@@ -182,36 +205,20 @@ fn grid_area(viewport: &Viewport) -> Rect {
     )
 }
 
-/// Rows of windows in order, each row centred, the rows centred together. The
-/// column count is the one that shows the windows largest overall.
+/// Rows of windows in order, each row centred, the rows centred together:
+/// ceil(sqrt(n)) columns and as many rows as needed, so the windows fill the
+/// screen as a balanced grid (2: side by side, 3: 2 + 1, 4: 2 x 2, 5: 3 + 2).
+/// Each window keeps its shape and fits its cell.
 fn layout_grid(sizes: &[(f64, f64)], area: Rect) -> Vec<Cell> {
     let count = sizes.len();
-    let mut best: Option<(usize, Vec<f64>, f64)> = None;
-    for columns in 1..=count {
-        let rows = count.div_ceil(columns);
-        let cell_width = (area.width - (columns - 1) as f64 * GAP) / columns as f64;
-        let cell_height = (area.height - (rows - 1) as f64 * GAP) / rows as f64;
-        if cell_width <= 0.0 || cell_height <= 0.0 {
-            continue;
-        }
-        let scales: Vec<f64> = sizes
-            .iter()
-            .map(|(width, height)| {
-                MAX_SCALE
-                    .min(cell_width / width.max(1.0))
-                    .min(cell_height / height.max(1.0))
-            })
-            .collect();
-        let score: f64 = sizes
-            .iter()
-            .zip(&scales)
-            .map(|((width, height), scale)| width * height * scale * scale)
-            .sum();
-        if best.as_ref().is_none_or(|(_, _, best_score)| score >= *best_score) {
-            best = Some((columns, scales, score));
-        }
+    if count == 0 {
+        return Vec::new();
     }
-    let Some((columns, scales, _)) = best else {
+    let columns = (count as f64).sqrt().ceil() as usize;
+    let row_count = count.div_ceil(columns);
+    let cell_width = (area.width - (columns - 1) as f64 * GAP) / columns as f64;
+    let cell_height = (area.height - (row_count - 1) as f64 * GAP) / row_count as f64;
+    if cell_width <= 0.0 || cell_height <= 0.0 {
         let centre = Cell {
             center_x: area.x + area.width / 2.0,
             center_y: area.y + area.height / 2.0,
@@ -219,7 +226,15 @@ fn layout_grid(sizes: &[(f64, f64)], area: Rect) -> Vec<Cell> {
             row: 0,
         };
         return vec![centre; count];
-    };
+    }
+    let scales: Vec<f64> = sizes
+        .iter()
+        .map(|(width, height)| {
+            MAX_SCALE
+                .min(cell_width / width.max(1.0))
+                .min(cell_height / height.max(1.0))
+        })
+        .collect();
     let rows: Vec<Vec<usize>> = (0..count)
         .collect::<Vec<_>>()
         .chunks(columns)
@@ -258,6 +273,11 @@ fn layout_grid(sizes: &[(f64, f64)], area: Rect) -> Vec<Cell> {
     cells
 }
 
+/// `Math.sign`: unlike `f64::signum`, zero for zero (a sideways wheel click).
+fn sign(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value.signum() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +292,19 @@ mod tests {
         assert!(cells.iter().all(|cell| cell.scale == 1.0));
         assert_eq!(cells[2].center_x, 500.0);
         assert_eq!(cells[0].center_x + cells[1].center_x, 1000.0);
+    }
+
+    #[test]
+    fn grid_uses_ceil_sqrt_columns() {
+        let area = Rect::new(0.0, 0.0, 1000.0, 1000.0);
+        let rows = |count: usize| {
+            layout_grid(&vec![(100.0, 100.0); count], area)
+                .iter()
+                .map(|cell| cell.row)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(2), [0, 0]);
+        assert_eq!(rows(4), [0, 0, 1, 1]);
+        assert_eq!(rows(5), [0, 0, 0, 1, 1]);
     }
 }

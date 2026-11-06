@@ -7,26 +7,16 @@ edition = "2024"
 [dependencies]
 bitflags = "2.11.0"
 thiserror = "2.0.12"
-smithay = {
-    git = "https://github.com/bea4dev/smithay.git",
-    rev = "ba36cf26cd7cdf4431319392301c82ea226dfc52",
-    features = ["use_system_lib", "xwayland"]
-}
-smithay-drm-extras = {
-    git = "https://github.com/bea4dev/smithay.git",
-    rev = "ba36cf26cd7cdf4431319392301c82ea226dfc52",
-    package = "smithay-drm-extras",
-    default-features = false
-}
+smithay = { git = "https://github.com/bea4dev/smithay.git", rev = "ba36cf26cd7cdf4431319392301c82ea226dfc52", features = ["use_system_lib", "xwayland"] }
+smithay-drm-extras = { git = "https://github.com/bea4dev/smithay.git", rev = "ba36cf26cd7cdf4431319392301c82ea226dfc52", package = "smithay-drm-extras", default-features = false }
 # xwayland-satellite, run in-process on its own thread (see
 # `xwayland_satellite.rs`). Renamed so the crate does not clash with that module.
-satellite = {
-    package = "xwayland-satellite",
-    git = "https://github.com/bea4dev/xwayland-satellite.git",
-    rev = "d995e79977d63e30e556302a347c6df8b7fd0961"
-}
+satellite = { package = "xwayland-satellite", git = "https://github.com/gentianster/xwayland-satellite.git", rev = "d973cb74eb065de00aec084fe3265ee65efd1585" }
 wayland-protocols = { version = "0.32.12", features = ["server", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
+# KDE-private protocols that plasmashell needs (taskbar window list, popup
+# placement); see `plasma_window_management.rs` and `protocols/plasma_shell.rs`.
+wayland-protocols-plasma = { version = "0.3.12", features = ["server"] }
 wayland-server = { version = "0.31.13", features = ["libwayland_1_23"] }
 # Protocols no published crate covers (`protocols/*.xml`).
 wayland-scanner = "0.31.10"

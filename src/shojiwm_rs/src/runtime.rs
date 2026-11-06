@@ -23,7 +23,10 @@ use shojiwm_lib::{
     runtime_input::{RuntimeInputConfig, RuntimeInputDeviceSnapshot},
     runtime_key_binding::RuntimeKeyBindingEntry,
     runtime_process::{RuntimeProcessAction, RuntimeProcessEntry},
-    runtime_workspace::{RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate},
+    runtime_workspace::{
+        RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate,
+        RuntimeWorkspaceMoveWindowEvent,
+    },
     ssd::{
         GestureSwipeEventSnapshot, ManagedWindowState, PointerMoveEventSnapshot,
         RuntimeWindowAction, SurfacePolicy, WaylandLayerSnapshot, WaylandOutputSnapshot,
@@ -76,10 +79,14 @@ pub(crate) struct Listeners {
     pub pointer_move_async: Vec<RefListener<PointerMoveEventSnapshot>>,
     pub gesture_swipe: Vec<RefListener<GestureSwipeEventSnapshot>>,
     pub gesture_swipe_async: Vec<RefListener<GestureSwipeEventSnapshot>>,
+    pub pointer_region:
+        Vec<RefListener<shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot>>,
     pub create_layer: Vec<RefListener<WaylandLayerSnapshot>>,
     pub update_layer: Vec<RefListener<WaylandLayerSnapshot>>,
     pub destroy_layer: Vec<RefListener<WaylandLayerSnapshot>>,
     pub workspace_activate: Vec<RefListener<RuntimeWorkspaceActivateRequestSnapshot>>,
+    pub workspace_move_window: Vec<RefListener<RuntimeWorkspaceMoveWindowEvent>>,
+    pub dnd_start: Vec<Listener<crate::dnd::DragSession>>,
 }
 
 pub(crate) type EffectFn<S> = Rc<dyn Fn(&S) -> SurfaceEffects>;
@@ -123,6 +130,14 @@ pub(crate) struct Registry {
     pub key_handlers: HashMap<String, Rc<dyn Fn()>>,
     pub window_move_modifier: Option<String>,
     pub window_resize_modifier: Option<String>,
+    pub pointer_regions: Vec<shojiwm_lib::runtime_pointer_region::PointerRegionSpec>,
+    pub app_lock_ignored: bool,
+    pub app_lock_ignore_modifier: Option<String>,
+    /// Handlers of `bind_hot_corner`, by region id.
+    pub region_handlers: HashMap<
+        String,
+        Rc<dyn Fn(&shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot)>,
+    >,
     pub processes: Vec<RuntimeProcessEntry>,
     pub debug: RuntimeDebugConfigUpdate,
     pub env: BTreeMap<String, String>,
@@ -406,6 +421,9 @@ pub(crate) fn publish_pending() {
                 shojiwm_lib::runtime_pointer::RuntimePointerConfigUpdate {
                     window_move_modifier: registry.window_move_modifier.clone(),
                     window_resize_modifier: registry.window_resize_modifier.clone(),
+                    regions: registry.pointer_regions.clone(),
+                    app_lock_ignored: registry.app_lock_ignored,
+                    app_lock_ignore_modifier: registry.app_lock_ignore_modifier.clone(),
                 },
             ));
         }
@@ -421,6 +439,7 @@ pub(crate) fn publish_pending() {
                 pointer_move_async: !listeners.pointer_move_async.is_empty(),
                 gesture_swipe: !listeners.gesture_swipe.is_empty(),
                 gesture_swipe_async: !listeners.gesture_swipe_async.is_empty(),
+                dnd: !listeners.dnd_start.is_empty(),
             }));
         }
         if pending.processes {

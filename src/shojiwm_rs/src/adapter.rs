@@ -11,6 +11,7 @@ use std::{
 };
 
 use shojiwm_lib::{
+    runtime_workspace::RuntimeWorkspaceMoveWindowEvent,
     runtime_api::{
         ConfigRuntime, DecorationRequest, EffectRequest, HostMessage, InputRequest, LaunchContext,
         ReloadPreparation, RuntimeError, RuntimeEvent, RuntimeLauncher, RuntimeReply,
@@ -111,6 +112,7 @@ impl ReactiveRuntime {
         crate::published::reset();
         crate::overlay::reset();
         crate::input_grab::reset();
+        crate::dnd::reset();
         runtime::reset();
         LAYER_OBSERVERS.with(|observers| observers.borrow_mut().clear());
         animation::reset_clock();
@@ -1025,8 +1027,23 @@ impl ConfigRuntime for ReactiveRuntime {
                         let invoked = batch(|| emit(|listeners| listeners.gesture_swipe.clone(), |listener| listener(event)));
                         RuntimeReply::PointerHook(pointer_hook(invoked))
                     }
+                    InputRequest::PointerRegion(event) => {
+                        let handler = with_registry(|registry| registry.region_handlers.get(&event.id).cloned());
+                        let invoked = batch(|| {
+                            let listened = emit(|listeners| listeners.pointer_region.clone(), |listener| listener(event));
+                            if let Some(handler) = &handler {
+                                handler(event);
+                            }
+                            listened || handler.is_some()
+                        });
+                        RuntimeReply::PointerHook(pointer_hook(invoked))
+                    }
                     InputRequest::InputGrab { grab_id, event } => {
                         let invoked = batch(|| crate::input_grab::dispatch(grab_id, event));
+                        RuntimeReply::PointerHook(pointer_hook(invoked))
+                    }
+                    InputRequest::Dnd(event) => {
+                        let invoked = crate::dnd::dispatch(event);
                         RuntimeReply::PointerHook(pointer_hook(invoked))
                     }
                 },
@@ -1042,7 +1059,16 @@ impl ConfigRuntime for ReactiveRuntime {
                     }
                 },
                 RuntimeRequest::Workspace(WorkspaceRequest::Activate(event)) => {
-                    let invoked = batch(|| emit(|listeners| listeners.workspace_activate.clone(), |listener| listener(event)));
+                    let invoked = match &event.window_id {
+                        Some(window_id) => {
+                            let event = RuntimeWorkspaceMoveWindowEvent {
+                                workspace_id: event.workspace_id.clone(),
+                                window_id: window_id.clone(),
+                            };
+                            batch(|| emit(|listeners| listeners.workspace_move_window.clone(), |listener| listener(&event)))
+                        }
+                        None => batch(|| emit(|listeners| listeners.workspace_activate.clone(), |listener| listener(event))),
+                    };
                     RuntimeReply::Handler(Box::new(handler_invocation(invoked)))
                 }
             })
@@ -1094,5 +1120,6 @@ impl ConfigRuntime for ReactiveRuntime {
         runtime::publish_pending();
         crate::overlay::reset();
         crate::input_grab::reset();
+        crate::dnd::reset();
     }
 }

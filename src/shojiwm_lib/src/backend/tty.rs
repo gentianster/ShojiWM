@@ -1994,13 +1994,20 @@ pub fn device_added(
         .map_err(|error| driver_load_error(path, "initialize EGL", &error))?;
     let ctx = EGLContext::new_with_priority(&egl, ContextPriority::High)?;
     let mut renderer = unsafe { GlesRenderer::new(ctx)? };
-    match renderer.bind_wl_display(&state.display_handle) {
-        Ok(()) => info!(?node, "bound wl_display for tty EGL clients"),
-        Err(error) => warn!(
-            ?node,
-            ?error,
-            "failed to bind wl_display for tty EGL clients"
-        ),
+    // Only the GPU clients render with (the first one opened, which hosts the dmabuf global)
+    // binds the display. Binding it on another GPU advertises that GPU's `wl_drm`: on a hybrid
+    // laptop with Mesa (no EGL_WL_bind_wayland_display) on the iGPU, NVIDIA's binding then
+    // made Xwayland render on the dGPU, and compositing those buffers on the iGPU failed the
+    // command submission (ENOMEM), which radeonsi answers with abort().
+    if state.dmabuf_global.is_none() {
+        match renderer.bind_wl_display(&state.display_handle) {
+            Ok(()) => info!(?node, "bound wl_display for tty EGL clients"),
+            Err(error) => warn!(
+                ?node,
+                ?error,
+                "failed to bind wl_display for tty EGL clients"
+            ),
+        }
     }
     state.shm_state.update_formats(renderer.shm_formats());
     if state.dmabuf_global.is_none() {
@@ -2391,10 +2398,11 @@ mod implicit_sync_tests {
 /// Surfaces that use `linux-drm-syncobj-v1` are always held: their release point is signalled
 /// from the CPU when the buffer drops, and nothing orders it after our GPU read. Other buffers
 /// are held unless `ShojiWM::implicit_sync_trusted`: when every GPU runs Mesa, an implicit-sync
-/// dma-buf carries our read as a fence the client waits on before rendering into it again, and
-/// an shm buffer is copied during the render, so holding those only delays their release. The
+/// dma-buf carries our read as a fence the client waits on before rendering into it again. The
 /// NVIDIA proprietary driver takes no part in implicit sync, neither as the GPU we render with
-/// nor as the one a client renders with (PRIME offload), so with one present everything is held.
+/// nor as the one a client renders with (PRIME offload), so with one present every dma-buf is
+/// held. An shm buffer is never held: it is copied during the render, so holding it would only
+/// delay its release.
 fn collect_client_buffers_for_hold(
     state: &ShojiWM,
     output: &Output,
@@ -2428,6 +2436,16 @@ fn collect_client_buffers_for_hold(
             .get::<RendererSurfaceStateUserData>()
             .and_then(|renderer_state| renderer_state.lock().ok()?.buffer().cloned())
         {
+            // An shm buffer is copied into a texture during the render, so the GPU never
+            // reads it: holding it only delays its release past the frame callback. A client
+            // that renders on the callback into whichever buffer is free (hyprpicker,
+            // double-buffered) then finds both busy, skips the frame and never draws again.
+            if matches!(
+                smithay::backend::renderer::buffer_type(&buffer),
+                Some(smithay::backend::renderer::BufferType::Shm)
+            ) {
+                return;
+            }
             held.push(buffer);
         }
     };
@@ -2440,6 +2458,7 @@ fn collect_client_buffers_for_hold(
     // The same test `render_surface` uses before drawing a client cursor; nothing is dispatched
     // between this and the render, so the pointer cannot move in between.
     let cursor_drawn_here = state.cursor_override.is_none()
+        && state.config_cursor_override.is_none()
         && state.space.output_geometry(output).is_some_and(|output_geo| {
             state.seat.get_pointer().is_some_and(|pointer| {
                 output_geo.to_f64().contains(pointer.current_location())
@@ -2452,7 +2471,8 @@ fn collect_client_buffers_for_hold(
         .chain(match &state.cursor_status {
             CursorImageStatus::Surface(surface) if cursor_drawn_here => Some(surface.clone()),
             _ => None,
-        });
+        })
+        .chain(state.dnd.active_icon_surface().cloned());
     for root in roots {
         with_surface_tree_downward(
             &root,
@@ -4282,6 +4302,7 @@ fn render_surface(
             report_tty_config_error(state, err);
         }
     }
+    state.refresh_drag_views();
     state.animation_frame_time_ms = None;
     // Output configuration is reactive. Evaluating the TypeScript runtime above can unmap this
     // output (for example, disabling the internal panel when a dock output appears). Do not carry
@@ -4502,6 +4523,7 @@ fn render_surface(
             start_time,
             cursor_status,
             cursor_override,
+            config_cursor_override,
             cursor_theme,
             pointer_images,
             current_pointer_image,
@@ -4614,8 +4636,9 @@ fn render_surface(
                     *cursor_status = CursorImageStatus::default_named();
                 }
 
-                let effective_cursor_status = cursor_override
-                    .map(CursorImageStatus::Named)
+                let effective_cursor_status = config_cursor_override
+                    .map(crate::cursor::CursorOverride::status)
+                    .or_else(|| cursor_override.map(CursorImageStatus::Named))
                     .unwrap_or_else(|| cursor_status.clone());
 
                 let hotspot = if let CursorImageStatus::Surface(surface) = &effective_cursor_status
@@ -4881,8 +4904,9 @@ fn render_surface(
         overlay_below_layers += content_elements.len();
         content_elements.extend(scene_elements);
 
-        let cursor_status_for_log = cursor_override
-            .map(CursorImageStatus::Named)
+        let cursor_status_for_log = config_cursor_override
+            .map(crate::cursor::CursorOverride::status)
+            .or_else(|| cursor_override.map(CursorImageStatus::Named))
             .unwrap_or_else(|| cursor_status.clone());
         // Capture paths receive content_for_capture (everything but cursor)
         // and cursor_elements separately so they can honour the client's
@@ -4912,6 +4936,28 @@ fn render_surface(
             state.output_overlays.render(&mut *renderer, &output,
                 (output_geo.size.w, output_geo.size.h), scale, &mut content_for_capture,
                 overlay_below_layers, TtyRenderElements::Snapshot);
+            // Drag views: above everything but the cursor.
+            let drag_elements = crate::backend::dnd::drag_elements(
+                &mut *renderer,
+                &mut state.dnd,
+                &output,
+                output_geo,
+                scale,
+                pointer_pos,
+            );
+            content_for_capture.splice(
+                0..0,
+                drag_elements
+                    .into_iter()
+                    .map(|element| match element {
+                        crate::backend::dnd::DragElement::Texture(element) => {
+                            TtyRenderElements::TransformedSnapshot(element)
+                        }
+                        crate::backend::dnd::DragElement::Backdrop(element) => {
+                            TtyRenderElements::TransformedDecoration(element)
+                        }
+                    }),
+            );
         }
         // The element count for diagnostics — final elements is built below
         // after capture has run against the by-reference slices.
