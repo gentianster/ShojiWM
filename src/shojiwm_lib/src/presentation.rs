@@ -920,6 +920,21 @@ impl ShojiWM {
         }
         drop(map);
 
+        // EGL may timestamp lock-surface commits too. Without signaling these
+        // barriers, the queued buffer and its frame callback never become current.
+        self.with_session_lock_surfaces_for_output(output, |surface, states| {
+            if let Some(mut commit_timer_state) = states
+                .data_map
+                .get::<CommitTimerBarrierStateUserData>()
+                .map(|commit_timer| commit_timer.lock().unwrap())
+                && commit_timer_state.signal_until(frame_target)
+            {
+                if let Some(client) = surface.client() {
+                    clients.insert(client.id(), client);
+                }
+            }
+        });
+
         let dh = self.display_handle.clone();
         let signaled = !clients.is_empty();
         for client in clients.into_values() {
