@@ -63,3 +63,47 @@ the runner does not hide failures with automatic retries.
 Known test limitation: existing satellite clipboard event-wait tests may fail
 intermittently at the pinned source revision. Commands report failures directly;
 this build setup does not claim to fix clipboard behavior or retry until success.
+
+## Deployed binaries (gebuntu)
+
+### Reproduction matrix
+
+- **shoji_wm** (compositor)
+  - Installed at: `/usr/bin/shoji_wm`
+  - sha256: `6cbe48afa897195037ccbbd1fbf6da6e385854d26d11e123b527fda2e5803f10`
+  - Source: gentianster/ShojiWM `b947f690b29fae64fe2397c1fbecfb7fe758d578`
+    (main; merge of PR #5, session-lock commit-timing fix `aae6391`)
+  - Built on gebuntu with system cargo/rustc 1.93.1 (see the toolchain note above).
+  - Live-verified by the user on 2026-11-07 (lock screen locks and unlocks).
+- **xwayland-satellite** (build-time dependency of the compositor)
+  - Pinned in `Cargo.lock` to gentianster/xwayland-satellite
+    `06511b6d08665ed55f4966f2e24fa387e58c9d17` (version 0.8.3).
+  - Builds use this lockfile pin. Known limitation: `tools/desktop.py satellite-test`
+    exercises the sibling `xwayland-satellite` checkout
+    (`SATELLITE = ROOT / "xwayland-satellite"`), not the pinned revision, so its
+    results do not cover the pin. This is a known gap; this change does not alter
+    desktop.py.
+- **xdg-desktop-portal-shojiwm** (portal backend)
+  - Installed at: `/usr/bin/xdg-desktop-portal-shojiwm`
+  - sha256: `1fc25cb2939ab42f770b8330446b087f0590ee57717ad000d3b725d2a747ebd3`
+  - File on disk dated 2026-10-10 23:25 (27,912,752 bytes).
+  - Source in this repo: `src/xdg-desktop-portal-shojiwm`; install assets in
+    `dist/` (`install-portal.sh`, service files).
+  - **The source revision that produced the installed binary was not recorded.**
+
+### Deploy convention for /usr/bin/shoji_wm
+
+- Stage the new binary, verify its sha256, then atomically rename it into place
+  with `mv -T` (a running session keeps the old inode).
+- Keep the replaced binary as `/usr/bin/.shoji_wm.before-<name>`.
+- Current backups on gebuntu: `.before-session-lock-fix-20261107`
+  (sha256 `46f6dba6b2a8696b0b182ef96e21043cb2a3e30de75715ff53b3c37c642270cd`),
+  `.before-satellite-pin-20261107`, `.before-integration-20261107`,
+  `.before-rebuild-20261107`, `.before-numlock`, `.before-fullscreen-fix`,
+  `.before-bookmark-position-fix`.
+
+### Standing rule
+
+- Every deploy updates this section in the same change: source revision, sha256,
+  and date are recorded at deploy time, for the portal as well. This rule exists
+  because the portal's October deploy went unrecorded.
