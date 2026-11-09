@@ -522,6 +522,7 @@ pub struct ShojiWM {
     pub layer_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub popup_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub config_error_report: Option<crate::config_error::ConfigErrorReport>,
+    pub failed_frame_evaluations: crate::config_error::FailedFrameEvaluations,
     pub layer_backdrop_cache: HashMap<String, crate::backend::shader_effect::CachedBackdropTexture>,
     pub layer_framebuffer_effect_states:
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
@@ -1921,6 +1922,7 @@ impl ShojiWM {
             layer_effect_evaluation_cache: HashMap::new(),
             popup_effect_evaluation_cache: HashMap::new(),
             config_error_report,
+            failed_frame_evaluations: Default::default(),
             layer_backdrop_cache: HashMap::new(),
             layer_framebuffer_effect_states: HashMap::new(),
             layer_effect_cache: HashMap::new(),
@@ -3299,6 +3301,7 @@ impl ShojiWM {
         self.runtime_scheduler_enabled = true;
         self.mark_all_window_decoration_policies_reloaded();
         self.config_error_report = None;
+        self.failed_frame_evaluations.clear();
         // The overlay was just cleared: effect failures that are still there must show up again.
         crate::backend::shader_effect::reset_effect_error_reports();
         self.runtime_poll_dirty = true;
@@ -3349,6 +3352,7 @@ impl ShojiWM {
         }
 
         self.config_error_report = None;
+        self.failed_frame_evaluations.clear();
         // The overlay was just cleared: effect failures that are still there must show up again.
         crate::backend::shader_effect::reset_effect_error_reports();
         self.runtime_poll_dirty = true;
