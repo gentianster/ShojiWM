@@ -1,5 +1,7 @@
 # ShojiWM upstream integration candidate
 
+**Deployment update, 2026-11-10 21:02 JST:** The user subsequently authorized the full update and chose atomic replacement before logout. The matching compositor, portal, SDK and decoration runtime are now installed and hash-verified. Existing processes were left running the old executables; fresh-login activation and live checks are pending. See `DESKTOP-BUILD.md` for exact installed hashes and fresh rollback records. The no-install statements below describe the earlier preparation phase. No push or main/PR merge has occurred.
+
 Date: 2026-11-10 (JST). Branch: `integration/upstream-20261110`.
 
 ## Scope and checkpoints

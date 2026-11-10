@@ -66,7 +66,19 @@ this build setup does not claim to fix clipboard behavior or retry until success
 
 ## Deployed binaries (gebuntu)
 
-### Reproduction matrix
+### Current installed stack: 2026-11-10 21:02 JST
+
+- Source: integration commit `13ed0a9c78d3d86bfe0b31c447f2a7367c5e525a`, with upstream ancestry recorded and PR #7 adaptations. Build code is identical to reviewed candidate `6f557fe`.
+- `/usr/bin/shoji_wm`: SHA-256 `db54115c4d4d1ee34dbfc94c904a378dda20bc1062dc25f883ba344ec5efdf76`.
+- `/usr/bin/xdg-desktop-portal-shojiwm`: SHA-256 `b948936d8e8e89bd8d4181f070f7142bcb9c39cc4280e052fa193fb880a375dd`.
+- Matching SDK and decoration runtime installed together under `/usr/lib/shojiwm`; every staged file and metadata entry verified. Runtime script SHA-256 `6514be6b683c20c97b25bd09672dff5eb134d529a97926824695c45f6c94b599`.
+- Build: system Cargo/Rust 1.93.1, `cargo build --locked --release -p shoji_wm -p xdg-desktop-portal-shojiwm -j 4` (5m57s). Embedded satellite remains exact `06511b6`.
+- User chose replacement before logout. Executables were atomically renamed and the runtime directory atomically exchanged, without truncation or a missing runtime path. No application was closed, service restarted, config reloaded or logout forced.
+- Immediately afterward, installed hashes matched the new set while running PIDs 8371 (compositor) and 769844 (portal) still matched the previous executable hashes. **Fresh-login activation and live behavior remain pending.** The user should avoid config reload, log out and log back in; verify new running executable hashes afterward.
+- Fresh complete rollback set and manifests: `/usr/local/lib/shojiwm-backups/upstream-20261110-13ed0a9/old/`. This includes both previous binaries and the entire previous `/usr/lib/shojiwm`. Restore binary/SDK/runtime as a matched set. The previous runtime directory is additionally retained at `/usr/lib/.shojiwm.before-upstream-13ed0a9`.
+- Deployment evidence: `result.json` and `apply-now.log` in that backup directory. The earlier logout-waiting job was stopped and confirmed unapplied before this replacement. No remote push or main/PR merge was performed.
+
+### Previous deployed stack, before the 21:02 update
 
 - **shoji_wm** (compositor)
   - Installed at: `/usr/bin/shoji_wm`
