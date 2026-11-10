@@ -85,11 +85,28 @@ this build setup does not claim to fix clipboard behavior or retry until success
     desktop.py.
 - **xdg-desktop-portal-shojiwm** (portal backend)
   - Installed at: `/usr/bin/xdg-desktop-portal-shojiwm`
-  - sha256: `1fc25cb2939ab42f770b8330446b087f0590ee57717ad000d3b725d2a747ebd3`
-  - File on disk dated 2026-10-10 23:25 (27,912,752 bytes).
+  - sha256: `e41956bdf07c3dc687e5d4adaaeafec42e7c7b3df1e6ca95f0029f638916cb69`
+  - Source: gentianster/ShojiWM `8ca5abe9672e66edf313d432ed03407bea470c6e`
+    (PR #7, preview resource cleanup and source picker improvements).
+  - Built with system Cargo/Rust 1.93.1 using
+    `CARGO_BUILD_JOBS=4 cargo build --release --locked -p xdg-desktop-portal-shojiwm --bin xdg-desktop-portal-shojiwm`.
+  - Deployed on 2026-11-10 at 17:41 JST (27,135,400 bytes). The staged binary
+    was hash-verified and atomically renamed into place; only the idle ShojiWM
+    portal backend was restarted. The compositor, frontend portal, GTK backend,
+    service definitions and user configuration were unchanged.
+  - Verified the running executable hash and ScreenCast source types through
+    both backend and frontend D-Bus interfaces. Three live cancellation cases
+    returned promptly; each released the thumbnail worker and thumbnail memfds.
+    A synthetic-window stream node was created and closed cleanly. The local
+    GStreamer validation client returned `target not found`, so end-to-end frame
+    reception in Chrome/OBS remains unverified; this is not a streaming pass.
+  - Rollback binary:
+    `/usr/bin/.xdg-desktop-portal-shojiwm.before-preview-fix-20261110`.
+    Its sha256 is `1fc25cb2939ab42f770b8330446b087f0590ee57717ad000d3b725d2a747ebd3`;
+    its original source revision is unknown. Restore it through a staged atomic
+    rename and restart only the backend when no sharing sessions are active.
   - Source in this repo: `src/xdg-desktop-portal-shojiwm`; install assets in
     `dist/` (`install-portal.sh`, service files).
-  - **The source revision that produced the installed binary was not recorded.**
 
 ### Deploy convention for /usr/bin/shoji_wm
 
