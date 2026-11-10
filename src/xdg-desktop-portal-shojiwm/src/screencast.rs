@@ -12,8 +12,7 @@ use crate::picker::{PickResult, PickerHandle};
 use crate::pipewire_stream::{self, StreamHandle, StreamSpec};
 use crate::sources::{self, OutputInfo, SourceInfo, SourceKind, ThumbnailUpdate, ToplevelInfo};
 use crate::toplevel_stream::{
-    self, CaptureSourceSpec, StreamHandle as ToplevelStreamHandle,
-    StreamSpec as ToplevelStreamSpec,
+    self, CaptureSourceSpec, StreamHandle as ToplevelStreamHandle, StreamSpec as ToplevelStreamSpec,
 };
 
 /// SourceTypes bitmask values from the portal spec.
@@ -54,6 +53,7 @@ enum AnyStreamHandle {
 /// its own stream and bookkeeping.
 struct Inner {
     picker: PickerHandle,
+    lifetimes: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     sessions: Mutex<HashMap<String, Selection>>,
     streams: Mutex<HashMap<String, AnyStreamHandle>>,
     /// Per-session `cursor_mode & EMBEDDED != 0`. Filled by SelectSources,
@@ -70,10 +70,12 @@ struct Inner {
 impl Inner {
     /// Tear down everything a session owns. Dropping the stream handle stops
     /// the capture thread and removes the PipeWire node.
-    fn cleanup_session(
-        &self,
-        session_key: &str,
-    ) {
+    fn cleanup_session(&self, session_key: &str) {
+        // Wake SelectSources even while discovery or the UI picker is pending.
+        // The receiver keeps the closed state observable across await races.
+        if let Some(lifetime) = self.lifetimes.lock().unwrap().remove(session_key) {
+            lifetime.send_replace(true);
+        }
         // Remove the session FIRST, the stream second. Start() does the
         // opposite (insert stream, then verify the session still exists), so
         // every interleaving of a Close racing a Start ends with the stream
@@ -83,35 +85,12 @@ impl Inner {
         // ordering the freshly started stream could land in the map after
         // cleanup had already run, leaving an unowned PipeWire node that
         // delivered zero frames to the app forever.
-        self.sessions
-            .lock()
-            .unwrap()
-            .remove(
-                session_key,
-            );
-        let stream = self.streams
-            .lock()
-            .unwrap()
-            .remove(
-                session_key,
-            );
-        let had_stream = stream
-            .is_some();
-        drop(
-            stream,
-        );
-        self.cursor_visibility
-            .lock()
-            .unwrap()
-            .remove(
-                session_key,
-            );
-        self.persist_modes
-            .lock()
-            .unwrap()
-            .remove(
-                session_key,
-            );
+        self.sessions.lock().unwrap().remove(session_key);
+        let stream = self.streams.lock().unwrap().remove(session_key);
+        let had_stream = stream.is_some();
+        drop(stream);
+        self.cursor_visibility.lock().unwrap().remove(session_key);
+        self.persist_modes.lock().unwrap().remove(session_key);
         tracing::info!(session_key, had_stream, "session closed and cleaned up");
     }
 }
@@ -300,6 +279,7 @@ impl ScreenCast {
         Self {
             inner: Arc::new(Inner {
                 picker,
+                lifetimes: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 streams: Mutex::new(HashMap::new()),
                 cursor_visibility: Mutex::new(HashMap::new()),
@@ -348,14 +328,22 @@ impl ScreenCast {
         // Export the impl Session object at the session handle so the portal
         // frontend can Close() us — that's how a session's stream gets torn
         // down when the app is done with it.
+        let (lifetime, _) = tokio::sync::watch::channel(false);
+        self.inner
+            .lifetimes
+            .lock()
+            .unwrap()
+            .insert(session_handle.to_string(), lifetime);
         let session = SessionImpl {
             session_key: session_handle.to_string(),
             inner: self.inner.clone(),
         };
-        server
-            .at(&session_handle, session)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("export session object: {e}",)))?;
+        if let Err(error) = server.at(&session_handle, session).await {
+            self.inner.cleanup_session(session_handle.as_str());
+            return Err(zbus::fdo::Error::Failed(format!(
+                "export session object: {error}"
+            )));
+        }
         Ok((0, HashMap::new()))
     }
 
@@ -377,20 +365,27 @@ impl ScreenCast {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(cursor_modes::EMBEDDED);
         let cursor_visible = cursor_mode & cursor_modes::EMBEDDED != 0;
-        self.inner
-            .cursor_visibility
-            .lock()
-            .unwrap()
-            .insert(session_handle.to_string(), cursor_visible);
         let persist_mode = options
             .get("persist_mode")
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0);
-        self.inner
-            .persist_modes
-            .lock()
-            .unwrap()
-            .insert(session_handle.to_string(), persist_mode);
+        let mut closed = {
+            let lifetimes = self.inner.lifetimes.lock().unwrap();
+            let Some(lifetime) = lifetimes.get(session_handle.as_str()) else {
+                return Ok((1, HashMap::new()));
+            };
+            self.inner
+                .cursor_visibility
+                .lock()
+                .unwrap()
+                .insert(session_handle.to_string(), cursor_visible);
+            self.inner
+                .persist_modes
+                .lock()
+                .unwrap()
+                .insert(session_handle.to_string(), persist_mode);
+            lifetime.subscribe()
+        };
         let restore_request = options.get("restore_data").and_then(decode_restore_data);
         tracing::info!(
             %handle, %session_handle, %app_id, requested_types = requested, cursor_mode, cursor_visible,
@@ -408,7 +403,14 @@ impl ScreenCast {
         .await
         .map_err(|e| zbus::fdo::Error::Failed(format!("thumbnail thread join: {e}")))?;
 
-        let sources_initial = init_rx.await.unwrap_or_default();
+        let sources_initial = tokio::select! {
+            biased;
+            _ = wait_for_session_close(&mut closed) => {
+                drop(_stream_guard);
+                return Ok((1, HashMap::new()));
+            }
+            initial = init_rx => initial.unwrap_or_default(),
+        };
         let filtered: Vec<SourceInfo> = sources_initial
             .into_iter()
             .filter(|s| match &s.kind {
@@ -429,6 +431,10 @@ impl ScreenCast {
                     "restore_data matched a live source; skipping picker",
                 );
                 drop(_stream_guard);
+                let lifetimes = self.inner.lifetimes.lock().unwrap();
+                if !lifetimes.contains_key(session_handle.as_str()) {
+                    return Ok((1, HashMap::new()));
+                }
                 self.inner
                     .sessions
                     .lock()
@@ -442,9 +448,17 @@ impl ScreenCast {
             );
         }
 
-        let pick = self.inner.picker.pick(filtered).await;
+        let pick = tokio::select! {
+            biased;
+            _ = wait_for_session_close(&mut closed) => PickResult::Cancelled,
+            pick = self.inner.picker.pick(handle.to_string(), filtered) => pick,
+        };
         drop(_stream_guard);
 
+        let lifetimes = self.inner.lifetimes.lock().unwrap();
+        if !lifetimes.contains_key(session_handle.as_str()) {
+            return Ok((1, HashMap::new()));
+        }
         match pick {
             PickResult::Source(src) => match src.kind {
                 SourceKind::Output(out) => {
@@ -519,8 +533,10 @@ impl ScreenCast {
                 // stream instead: the compositor renders its output captures
                 // upright at the as-displayed size.
                 let (logical_w, logical_h) = out.logical_mode_size();
-                let use_screencopy =
-                    matches!(out.transform, wayland_client::protocol::wl_output::Transform::Normal);
+                let use_screencopy = matches!(
+                    out.transform,
+                    wayland_client::protocol::wl_output::Transform::Normal
+                );
                 let (node_id, handle) = if use_screencopy {
                     let spec = StreamSpec {
                         output_name: out.name.clone(),
@@ -576,25 +592,19 @@ impl ScreenCast {
                 // capture shows 0x0 forever. Verify AFTER inserting: if the
                 // session is gone, either cleanup_session already dropped our
                 // insert or we drop it here, and the app gets "cancelled".
-                if !self.inner.sessions.lock().unwrap().contains_key(&session_key) {
-                    drop(
-                        self.inner.streams
-                            .lock()
-                            .unwrap()
-                            .remove(
-                                &session_key,
-                            ),
-                    );
+                if !self
+                    .inner
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key(&session_key)
+                {
+                    drop(self.inner.streams.lock().unwrap().remove(&session_key));
                     tracing::warn!(
                         session_key,
                         "session closed during Start; dropped fresh stream and cancelled",
                     );
-                    return Ok(
-                        (
-                            1, 
-                            HashMap::new(),
-                        ),
-                    );
+                    return Ok((1, HashMap::new()));
                 }
 
                 let mut stream_props: HashMap<String, Value> = HashMap::new();
@@ -642,33 +652,21 @@ impl ScreenCast {
                     .streams
                     .lock()
                     .unwrap()
-                    .insert(
-                        session_key.
-                            clone(), 
-                        AnyStreamHandle::Toplevel(
-                            handle_owned,
-                        ),
-                    );
+                    .insert(session_key.clone(), AnyStreamHandle::Toplevel(handle_owned));
                 // Same closed-during-Start guard as the Output arm above.
-                if !self.inner.sessions.lock().unwrap().contains_key(&session_key) {
-                    drop(
-                        self.inner.streams
-                            .lock()
-                            .unwrap()
-                            .remove(
-                                &session_key,
-                            ),
-                    );
+                if !self
+                    .inner
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key(&session_key)
+                {
+                    drop(self.inner.streams.lock().unwrap().remove(&session_key));
                     tracing::warn!(
                         session_key,
                         "session closed during Start; dropped fresh stream and cancelled",
                     );
-                    return Ok(
-                        (
-                            1,
-                            HashMap::new(),
-                        ),
-                    );
+                    return Ok((1, HashMap::new()));
                 }
 
                 let mut stream_props: HashMap<String, Value> = HashMap::new();
@@ -687,5 +685,36 @@ impl ScreenCast {
                 Ok((1, HashMap::new()))
             }
         }
+    }
+}
+
+/// Handles both Close-before-wait and Close-while-waiting without a lost wakeup.
+async fn wait_for_session_close(closed: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*closed.borrow_and_update() {
+        if closed.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn close_before_wait_is_not_lost() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        wait_for_session_close(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn close_wakes_pending_selection() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let waiter = tokio::spawn(async move { wait_for_session_close(&mut rx).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tx.send_replace(true);
+        waiter.await.unwrap();
     }
 }

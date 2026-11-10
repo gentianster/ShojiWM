@@ -15,7 +15,8 @@
 //! than running a parallel async pipeline. Each `SelectSources` call gets a
 //! fresh Wayland connection that's torn down when the function returns.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
@@ -268,26 +269,24 @@ impl Dispatch<wl_output::WlOutput, ()> for AppData {
         match event {
             wl_output::Event::Name { name } => cur.name = name,
             wl_output::Event::Description { description } => cur.description = description,
-            wl_output::Event::Geometry { transform, .. } => {
-                if let WEnum::Value(transform) = transform {
-                    cur.transform = transform;
-                }
-            }
+            wl_output::Event::Geometry {
+                transform: WEnum::Value(transform),
+                ..
+            } => cur.transform = transform,
             wl_output::Event::Mode {
                 flags,
                 width,
                 height,
                 refresh,
+            } if flags
+                .into_result()
+                .map(|f| f.contains(wl_output::Mode::Current))
+                .unwrap_or(false) =>
+            {
+                cur.width = width;
+                cur.height = height;
+                cur.refresh_mhz = refresh;
             }
-                if flags
-                    .into_result()
-                    .map(|f| f.contains(wl_output::Mode::Current))
-                    .unwrap_or(false)
-                => {
-                    cur.width = width;
-                    cur.height = height;
-                    cur.refresh_mhz = refresh;
-                }
             wl_output::Event::Done => {
                 let info = state.output_pending.pop().unwrap();
                 state.outputs.push(DiscoveredOutput {
@@ -410,8 +409,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for AppData {
                 format: WEnum::Value(f),
             } => {
                 // Prefer Xrgb8888 / Argb8888 over more exotic ones.
-                let is_preferred =
-                    matches!(f, wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888);
+                let is_preferred = matches!(f, wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888);
                 if c.constraint_format.is_none() || is_preferred {
                     c.constraint_format = Some(f);
                 }
@@ -457,7 +455,10 @@ fn capture_output_thumbnail(
         let s = app.state.lock().unwrap();
         (s.capture_manager.clone()?, s.output_source_manager.clone()?)
     };
-    let source = output_mgr.create_source(output, qh, ());
+    let source = ProtocolGuard::new(
+        output_mgr.create_source(output, qh, ()),
+        ExtImageCaptureSourceV1::destroy,
+    );
     capture_via_source(event_queue, app, qh, &manager, &source)
 }
 
@@ -474,7 +475,10 @@ fn capture_toplevel_thumbnail(
             s.toplevel_source_manager.clone()?,
         )
     };
-    let source = toplevel_mgr.create_source(toplevel, qh, ());
+    let source = ProtocolGuard::new(
+        toplevel_mgr.create_source(toplevel, qh, ()),
+        ExtImageCaptureSourceV1::destroy,
+    );
     capture_via_source(event_queue, app, qh, &manager, &source)
 }
 
@@ -493,11 +497,14 @@ fn capture_via_source(
         *c = CaptureState::default();
     }
 
-    let session = manager.create_session(
-        source,
-        ext_image_copy_capture_manager_v1::Options::empty(),
-        qh,
-        (),
+    let session = ProtocolGuard::new(
+        manager.create_session(
+            source,
+            ext_image_copy_capture_manager_v1::Options::empty(),
+            qh,
+            (),
+        ),
+        ExtImageCopyCaptureSessionV1::destroy,
     );
 
     // Drain buffer_size / shm_format / done.
@@ -513,28 +520,22 @@ fn capture_via_source(
         let c = app.capture.lock().unwrap();
         if !c.constraints_done {
             tracing::debug!("thumbnail: constraints never finalized");
-            session.destroy();
             return None;
         }
         (c.constraint_width, c.constraint_height, c.constraint_format)
     };
     if width == 0 || height == 0 {
-        session.destroy();
         return None;
     }
     let format = format.unwrap_or(wl_shm::Format::Xrgb8888);
-    let stride = (width * 4) as i32;
-    let size = stride as usize * height as usize;
+    let (stride, _) = shm_layout(width, height)?;
+    let buffer = allocate_shm_buffer(app, qh, width, height, stride, format)?;
 
-    // Allocate a memfd-backed buffer the compositor can write into.
-    let Some(buffer_artifacts) = allocate_shm_buffer(app, qh, width, height, stride, format) else {
-        session.destroy();
-        return None;
-    };
-    let (wl_buffer, ptr, _pool, _memfd) = buffer_artifacts;
-
-    let frame = session.create_frame(qh, ());
-    frame.attach_buffer(&wl_buffer);
+    let frame = ProtocolGuard::new(
+        session.create_frame(qh, ()),
+        ExtImageCopyCaptureFrameV1::destroy,
+    );
+    frame.attach_buffer(&buffer.buffer);
     frame.capture();
 
     // Drain until ready/failed (or we give up).
@@ -556,21 +557,109 @@ fn capture_via_source(
         }
     };
 
-    let thumbnail = if outcome {
-        unsafe { decode_buffer(ptr, size, width, height, format) }
+    // Guards release the frame, buffer, mapping, session and source on every path.
+    if outcome {
+        unsafe {
+            decode_buffer(
+                buffer.mapping.ptr,
+                buffer.mapping.size,
+                width,
+                height,
+                format,
+            )
+        }
     } else {
         None
-    };
-
-    frame.destroy();
-    session.destroy();
-    wl_buffer.destroy();
-    // pool + memfd dropped here, unmapping their mmaps.
-
-    thumbnail
+    }
 }
 
-/// (wl_buffer, mmap ptr, pool, memfd) — all four must stay alive together.
+/// Wayland proxies do not send their destructor when their Rust handle drops.
+struct ProtocolGuard<T> {
+    proxy: T,
+    destroy: fn(&T),
+}
+
+impl<T> ProtocolGuard<T> {
+    fn new(proxy: T, destroy: fn(&T)) -> Self {
+        Self { proxy, destroy }
+    }
+}
+
+impl<T> std::ops::Deref for ProtocolGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.proxy
+    }
+}
+
+impl<T> Drop for ProtocolGuard<T> {
+    fn drop(&mut self) {
+        (self.destroy)(&self.proxy);
+    }
+}
+
+/// Own the mapping independently of the fd, including allocation-error paths.
+struct ShmMapping {
+    ptr: NonNull<u8>,
+    size: usize,
+    fd: OwnedFd,
+}
+
+impl ShmMapping {
+    fn new(size: usize) -> Option<Self> {
+        if size == 0 || size > i32::MAX as usize {
+            return None;
+        }
+        let fd =
+            rustix::fs::memfd_create("shojiwm-portal-thumbnail", rustix::fs::MemfdFlags::CLOEXEC)
+                .ok()?;
+        rustix::fs::ftruncate(&fd, size as u64).ok()?;
+        let raw = unsafe {
+            rustix::mm::mmap(
+                std::ptr::null_mut(),
+                size,
+                ProtFlags::READ,
+                MapFlags::SHARED,
+                fd.as_fd(),
+                0,
+            )
+        }
+        .ok()?;
+        let Some(ptr) = NonNull::new(raw.cast::<u8>()) else {
+            unsafe {
+                let _ = rustix::mm::munmap(raw, size);
+            }
+            return None;
+        };
+        Some(Self { ptr, size, fd })
+    }
+}
+
+impl Drop for ShmMapping {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = rustix::mm::munmap(self.ptr.as_ptr().cast(), self.size);
+        }
+    }
+}
+
+struct ShmBuffer {
+    buffer: ProtocolGuard<wl_buffer::WlBuffer>,
+    mapping: ShmMapping,
+}
+
+fn shm_layout(width: u32, height: u32) -> Option<(i32, usize)> {
+    if width == 0 || height == 0 || height > i32::MAX as u32 {
+        return None;
+    }
+    let stride = i32::try_from(width.checked_mul(4)?).ok()?;
+    let size = usize::try_from(stride).ok()?.checked_mul(height as usize)?;
+    if size > i32::MAX as usize {
+        return None;
+    }
+    Some((stride, size))
+}
+
 fn allocate_shm_buffer(
     app: &mut AppData,
     qh: &QueueHandle<AppData>,
@@ -578,33 +667,24 @@ fn allocate_shm_buffer(
     height: u32,
     stride: i32,
     format: wl_shm::Format,
-) -> Option<(
-    wl_buffer::WlBuffer,
-    NonNull<u8>,
-    wl_shm_pool::WlShmPool,
-    std::os::fd::OwnedFd,
-)> {
+) -> Option<ShmBuffer> {
     let shm = app.state.lock().unwrap().shm.clone()?;
-    let size = stride as usize * height as usize;
-    let memfd =
-        rustix::fs::memfd_create("shojiwm-portal-thumbnail", rustix::fs::MemfdFlags::CLOEXEC)
-            .ok()?;
-    rustix::fs::ftruncate(&memfd, size as u64).ok()?;
-    let ptr = unsafe {
-        rustix::mm::mmap(
-            std::ptr::null_mut(),
-            size,
-            ProtFlags::READ,
-            MapFlags::SHARED,
-            memfd.as_fd(),
-            0,
-        )
+    let (expected_stride, size) = shm_layout(width, height)?;
+    if stride != expected_stride {
+        return None;
     }
-    .ok()?;
-    let ptr = NonNull::new(ptr.cast::<u8>())?;
-    let pool = shm.create_pool(memfd.as_fd(), size as i32, qh, ());
-    let buffer = pool.create_buffer(0, width as i32, height as i32, stride, format, qh, ());
-    Some((buffer, ptr, pool, memfd))
+    let mapping = ShmMapping::new(size)?;
+    let pool = ProtocolGuard::new(
+        shm.create_pool(mapping.fd.as_fd(), size as i32, qh, ()),
+        wl_shm_pool::WlShmPool::destroy,
+    );
+    let buffer = ProtocolGuard::new(
+        pool.create_buffer(0, width as i32, height as i32, stride, format, qh, ()),
+        wl_buffer::WlBuffer::destroy,
+    );
+    // wl_buffer retains the server-side storage; the pool object is no longer needed.
+    drop(pool);
+    Some(ShmBuffer { buffer, mapping })
 }
 
 /// Convert the BGRx / ARGB SHM buffer into an iced RGBA image, downscaled to
@@ -670,11 +750,16 @@ pub struct ThumbnailUpdate {
 pub struct ThumbnailStream {
     stop: Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+    socket: Arc<Mutex<Option<UnixStream>>>,
 }
 
 impl Drop for ThumbnailStream {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Interrupt a roundtrip even when the compositor stops responding.
+        if let Some(socket) = self.socket.lock().unwrap().as_ref() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -697,10 +782,22 @@ pub fn start_thumbnail_stream(
 ) -> ThumbnailStream {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_thread = stop.clone();
+    let socket = Arc::new(Mutex::new(None));
+    let socket_for_thread = socket.clone();
     let join = std::thread::Builder::new()
         .name("portal-thumbnails".into())
         .spawn(move || {
-            if let Err(e) = run_stream(init_tx, updates_tx, stop_for_thread) {
+            let result = run_stream(
+                init_tx,
+                updates_tx,
+                stop_for_thread.clone(),
+                socket_for_thread.clone(),
+            );
+            // Do not keep a failed worker's connection alive via the cancellation handle.
+            socket_for_thread.lock().unwrap().take();
+            if let Err(e) = result
+                && !stop_for_thread.load(std::sync::atomic::Ordering::SeqCst)
+            {
                 tracing::warn!("thumbnail stream exited: {e}");
             }
         })
@@ -708,6 +805,7 @@ pub fn start_thumbnail_stream(
     ThumbnailStream {
         stop,
         join: Some(join),
+        socket,
     }
 }
 
@@ -715,8 +813,16 @@ fn run_stream(
     init_tx: tokio::sync::oneshot::Sender<Vec<SourceInfo>>,
     updates_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    socket: Arc<Mutex<Option<UnixStream>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
+    {
+        let mut socket = socket.lock().unwrap();
+        *socket = Some(UnixStream::from(conn.as_fd().try_clone_to_owned()?));
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+    }
     let display = conn.display();
     let mut event_queue: EventQueue<AppData> = conn.new_event_queue();
     let qh = event_queue.handle();
@@ -838,4 +944,94 @@ fn run_stream(
         std::thread::sleep(tick);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn protocol_guard_destroys_once_on_early_return() {
+        fn cleanup(counter: &Arc<AtomicUsize>) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        fn early_return(counter: Arc<AtomicUsize>) -> Option<()> {
+            let _guard = ProtocolGuard::new(counter, cleanup);
+            None?;
+            Some(())
+        }
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(early_return(counter.clone()), None);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shm_layout_rejects_zero_and_overflow() {
+        assert_eq!(shm_layout(320, 180), Some((1280, 230400)));
+        for (w, h) in [
+            (0, 100),
+            (100, 0),
+            (u32::MAX, 1),
+            (1, u32::MAX),
+            (1_000_000, 1_000_000),
+        ] {
+            assert!(shm_layout(w, h).is_none());
+        }
+        assert!(ShmMapping::new(0).is_none());
+        assert!(ShmMapping::new(i32::MAX as usize + 1).is_none());
+    }
+
+    #[test]
+    fn repeated_mapping_drop_releases_fd_and_mmap() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        for _ in 0..32 {
+            let mapping = ShmMapping::new(4096).unwrap();
+            let fd_path = format!("/proc/self/fd/{}", mapping.fd.as_raw_fd());
+            let inode = std::fs::metadata(&fd_path).unwrap().ino();
+            let has_mapping = || {
+                std::fs::read_to_string("/proc/self/maps")
+                    .unwrap()
+                    .lines()
+                    .any(|line| {
+                        line.split_whitespace()
+                            .nth(4)
+                            .and_then(|s| s.parse::<u64>().ok())
+                            == Some(inode)
+                            && line.contains("memfd:shojiwm-portal-thumbnail")
+                    })
+            };
+            assert!(has_mapping());
+            drop(mapping);
+            assert!(!has_mapping(), "thumbnail mapping survived its owner");
+            assert!(
+                std::fs::metadata(&fd_path)
+                    .map(|m| m.ino() != inode)
+                    .unwrap_or(true)
+            );
+        }
+    }
+
+    #[test]
+    fn stream_drop_interrupts_blocked_reader_before_joining() {
+        use std::io::Read;
+        let (mut reader, _server) = UnixStream::pair().unwrap();
+        let socket = reader.try_clone().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut byte = [0];
+            assert_eq!(reader.read(&mut byte).unwrap(), 0);
+        });
+        let stream = ThumbnailStream {
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            join: Some(join),
+            socket: Arc::new(Mutex::new(Some(socket))),
+        };
+        let stop = stream.stop.clone();
+        started_rx.recv().unwrap();
+        drop(stream);
+        assert!(stop.load(Ordering::SeqCst));
+    }
 }
