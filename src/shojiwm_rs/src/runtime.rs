@@ -14,10 +14,10 @@ use std::{
 
 use shojiwm_lib::{
     activation_environment::{RuntimeEnvOperation, RuntimeEnvUpdates},
-    frame_pacing::FramePacing,
     config::RuntimeOutputConfig,
     cursor::RuntimeCursorConfigUpdate,
-    keyboard_layout::KeyboardLayoutSnapshot,
+    frame_pacing::FramePacing,
+    keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
     runtime_api::{HostMessage, RuntimeHost},
     runtime_debug::RuntimeDebugConfigUpdate,
     runtime_input::{RuntimeInputConfig, RuntimeInputDeviceSnapshot},
@@ -25,13 +25,14 @@ use shojiwm_lib::{
     runtime_process::{RuntimeProcessAction, RuntimeProcessEntry},
     runtime_workspace::{
         RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate,
-        RuntimeWorkspaceMoveWindowEvent,
+        RuntimeWorkspaceCreateEvent, RuntimeWorkspaceMoveWindowEvent,
     },
     ssd::{
         GestureSwipeEventSnapshot, ManagedWindowState, PointerMoveEventSnapshot,
         RuntimeWindowAction, SurfacePolicy, WaylandLayerSnapshot, WaylandOutputSnapshot,
         WaylandPopupSnapshot, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
-        WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot, WindowEffectConfig,
+        WindowDecorationClientSnapshot, WindowDecorationModeSnapshot,
+        WindowDecorationPolicyContextSnapshot, WindowEffectConfig,
         WindowFullscreenRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
         WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
         WindowTransform,
@@ -40,9 +41,7 @@ use shojiwm_lib::{
 
 use crate::{
     animation::TimerHandle,
-    compositor::{
-        DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, SurfaceRef,
-    },
+    compositor::{DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, SurfaceRef},
     effect::{Effect, SurfaceEffects},
     output_composition::OutputStack,
     reactive::{Observer, Scope, Signal},
@@ -75,10 +74,12 @@ pub(crate) struct Listeners {
     pub output_change: Vec<RefListener<OutputChangeEvent>>,
     pub input_change: Vec<RefListener<InputChangeEvent>>,
     pub keyboard_layout: Vec<RefListener<KeyboardLayoutSnapshot>>,
+    pub keyboard_locks: Vec<RefListener<KeyboardLocksSnapshot>>,
     pub pointer_move: Vec<RefListener<PointerMoveEventSnapshot>>,
     pub pointer_move_async: Vec<RefListener<PointerMoveEventSnapshot>>,
     pub gesture_swipe: Vec<RefListener<GestureSwipeEventSnapshot>>,
     pub gesture_swipe_async: Vec<RefListener<GestureSwipeEventSnapshot>>,
+    pub gesture_pinch_async: Vec<RefListener<shojiwm_lib::ssd::GesturePinchEventSnapshot>>,
     pub pointer_region:
         Vec<RefListener<shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot>>,
     pub create_layer: Vec<RefListener<WaylandLayerSnapshot>>,
@@ -86,6 +87,7 @@ pub(crate) struct Listeners {
     pub destroy_layer: Vec<RefListener<WaylandLayerSnapshot>>,
     pub workspace_activate: Vec<RefListener<RuntimeWorkspaceActivateRequestSnapshot>>,
     pub workspace_move_window: Vec<RefListener<RuntimeWorkspaceMoveWindowEvent>>,
+    pub workspace_create: Vec<RefListener<RuntimeWorkspaceCreateEvent>>,
     pub dnd_start: Vec<Listener<crate::dnd::DragSession>>,
 }
 
@@ -96,8 +98,14 @@ pub(crate) type SurfacePolicyFn = Rc<dyn Fn(SurfaceRef<'_>) -> Option<SurfacePol
 /// Per-window state signals, keyed by state key name and value type.
 pub(crate) type WindowStateSlots = HashMap<(&'static str, TypeId), Rc<dyn Any>>;
 pub(crate) type CompositionFn = Rc<dyn Fn(Window) -> Composition>;
-pub(crate) type DecorationPolicyFn =
-    Rc<dyn Fn(&WaylandWindowSnapshot, &WindowDecorationPolicyContextSnapshot) -> WindowDecorationModeSnapshot>;
+pub(crate) type DecorationPolicyFn = Rc<
+    dyn Fn(
+        &WaylandWindowSnapshot,
+        &WindowDecorationPolicyContextSnapshot,
+    ) -> WindowDecorationModeSnapshot,
+>;
+pub(crate) type KdeDefaultDecorationFn =
+    Rc<dyn Fn(&WindowDecorationClientSnapshot) -> WindowDecorationModeSnapshot>;
 pub(crate) type OutputConfigureFn =
     Rc<dyn Fn(&crate::compositor::OutputContext) -> BTreeMap<String, Option<RuntimeOutputConfig>>>;
 pub(crate) type InputConfigureFn =
@@ -126,6 +134,7 @@ pub(crate) struct Registry {
     pub listeners: Listeners,
     pub composition: Option<CompositionFn>,
     pub decoration_policy: Option<DecorationPolicyFn>,
+    pub kde_default_decoration: Option<KdeDefaultDecorationFn>,
     pub key_bindings: Vec<RuntimeKeyBindingEntry>,
     pub key_handlers: HashMap<String, Rc<dyn Fn()>>,
     pub window_move_modifier: Option<String>,
@@ -177,6 +186,7 @@ pub(crate) struct GlobalSignals {
     pub inputs: Signal<BTreeMap<String, RuntimeInputDeviceSnapshot>>,
     pub layers: Signal<BTreeMap<String, WaylandLayerSnapshot>>,
     pub keyboard_layout: Signal<Option<KeyboardLayoutSnapshot>>,
+    pub keyboard_locks: Signal<Option<KeyboardLocksSnapshot>>,
 }
 
 pub(crate) fn global() -> GlobalSignals {
@@ -189,6 +199,7 @@ pub(crate) fn global() -> GlobalSignals {
                 inputs: scope.signal(BTreeMap::new()),
                 layers: scope.signal(BTreeMap::new()),
                 keyboard_layout: scope.signal(None),
+                keyboard_locks: scope.signal(None),
             }
         })
     })
@@ -349,10 +360,7 @@ impl Windows {
     }
 
     pub fn all(&self) -> Vec<Rc<WindowEntry>> {
-        self.order
-            .iter()
-            .filter_map(|id| self.by_id(id))
-            .collect()
+        self.order.iter().filter_map(|id| self.by_id(id)).collect()
     }
 }
 
@@ -365,7 +373,10 @@ pub(crate) fn all_windows() -> Vec<Rc<WindowEntry>> {
 }
 
 /// Run a list of listeners, cloned out of the registry first.
-pub(crate) fn emit<L: ?Sized>(select: impl FnOnce(&Listeners) -> Vec<Rc<L>>, call: impl Fn(&L)) -> bool {
+pub(crate) fn emit<L: ?Sized>(
+    select: impl FnOnce(&Listeners) -> Vec<Rc<L>>,
+    call: impl Fn(&L),
+) -> bool {
     let listeners = with_registry(|registry| select(&registry.listeners));
     for listener in &listeners {
         call(listener);
@@ -434,13 +445,16 @@ pub(crate) fn publish_pending() {
         }
         if pending.event_filter {
             let listeners = &registry.listeners;
-            messages.push(HostMessage::EventFilter(shojiwm_lib::ssd::RuntimeEventConfigUpdate {
-                pointer_move: !listeners.pointer_move.is_empty(),
-                pointer_move_async: !listeners.pointer_move_async.is_empty(),
-                gesture_swipe: !listeners.gesture_swipe.is_empty(),
-                gesture_swipe_async: !listeners.gesture_swipe_async.is_empty(),
-                dnd: !listeners.dnd_start.is_empty(),
-            }));
+            messages.push(HostMessage::EventFilter(
+                shojiwm_lib::ssd::RuntimeEventConfigUpdate {
+                    pointer_move: !listeners.pointer_move.is_empty(),
+                    pointer_move_async: !listeners.pointer_move_async.is_empty(),
+                    gesture_swipe: !listeners.gesture_swipe.is_empty(),
+                    gesture_swipe_async: !listeners.gesture_swipe_async.is_empty(),
+                    gesture_pinch_async: !listeners.gesture_pinch_async.is_empty(),
+                    dnd: !listeners.dnd_start.is_empty(),
+                },
+            ));
         }
         if pending.processes {
             messages.push(HostMessage::Process(

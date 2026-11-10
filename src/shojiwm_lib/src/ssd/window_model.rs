@@ -109,6 +109,21 @@ pub struct WindowDecorationPolicyContextSnapshot {
     pub reason: WindowDecorationPolicyReasonSnapshot,
 }
 
+/// The process behind a client that bound the legacy KDE decoration manager,
+/// before it has any window: the manager's default mode is decided per
+/// client, from this.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowDecorationClientSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// `/proc/<pid>/exe`, when readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// `/proc/<pid>/cmdline`, split into its arguments.
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowDecorationDecisionSnapshot {
@@ -234,6 +249,23 @@ pub struct GestureSwipeEventSnapshot {
     pub velocity_y: f64,
     pub output_name: Option<String>,
     pub device: Option<crate::runtime_input::RuntimeInputDeviceSnapshot>,
+    pub timestamp: u64,
+}
+
+/// A touchpad pinch: `scale` is the fingers' spread relative to the start
+/// (1 at the start, above 1 spreading), `rotation` the change in angle since
+/// the last update in degrees, clockwise positive.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GesturePinchEventSnapshot {
+    pub phase: GestureSwipePhaseSnapshot,
+    pub fingers: u32,
+    pub scale: f64,
+    pub rotation: f64,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub position: Option<PointerMovePointSnapshot>,
+    pub output_name: Option<String>,
     pub timestamp: u64,
 }
 
@@ -401,16 +433,19 @@ pub enum ManagedWindowAnimationMode {
     Multiply,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[derive(Default)]
 pub enum ManagedWindowAnimationEasingSnapshot {
     #[default]
     Linear,
-    CubicBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
+    CubicBezier {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
 }
-
 
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

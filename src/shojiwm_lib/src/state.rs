@@ -35,7 +35,9 @@ use smithay::{
             RecvFlags, recv,
             sockopt::{socket_error, socket_peercred},
         },
-        wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationMode,
+        wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::{
+            Mode as KdeDecorationMode, OrgKdeKwinServerDecorationManager,
+        },
         wayland_server::{
             Display, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
@@ -94,6 +96,9 @@ use crate::backend::tty::{
     apply_tty_output_mode, tty_connected_outputs, tty_output_available_modes,
 };
 use crate::backend::visual::{inverse_transform_point, transformed_rect, transformed_root_rect};
+use crate::runtime_api::{
+    HostMessage, ReloadPreparation, RuntimeBoot, RuntimeError, RuntimeHandle, RuntimeHost,
+};
 use crate::runtime_input::{
     RuntimeInputConfig, RuntimeInputConfigUpdate, RuntimeInputDeviceSnapshot,
     apply_config_to_libinput_devices, apply_keyboard_config, libinput_device_key,
@@ -112,9 +117,6 @@ use crate::runtime_process::{
     kill_runtime_service, should_restart_service, spawn_runtime_process,
 };
 use crate::runtime_workspace::RuntimeWorkspaceConfigUpdate;
-use crate::runtime_api::{
-    HostMessage, ReloadPreparation, RuntimeBoot, RuntimeError, RuntimeHandle, RuntimeHost,
-};
 use crate::ssd::{
     BackgroundEffectConfig, DecorationInteractionSnapshot, DecorationInteractionTarget,
     DecorationPointerMoveAsyncInvocation, LogicalPoint, LogicalRect,
@@ -317,6 +319,13 @@ pub struct ShojiWM {
     pub active_idle_inhibit_labels: Vec<String>,
     pub session_lock_state: SessionLockManagerState,
     pub session_lock_active: bool,
+    /// The lock object holding the current lock. While it is alive no other
+    /// client may lock (ext-session-lock-v1), which is what keeps a second
+    /// client from locking and then unlocking someone else's lock. `None` while
+    /// unlocked, and while started locked until the first locker takes over.
+    /// The config's first enable ran; `start_session_locked` no longer applies.
+    pub initial_config_enabled: bool,
+    pub session_locker: Option<smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1>,
     pub session_lock_surfaces: HashMap<String, LockSurface>,
     /// Live capture sessions, kept alive so dropping doesn't auto-send
     /// `stopped` to clients. Keyed by source id.
@@ -384,6 +393,17 @@ pub struct ShojiWM {
     /// winit renderer. There are no tty backends to try it on there.
     pub winit_dmabuf_import:
         Option<Box<dyn FnMut(&smithay::backend::allocator::dmabuf::Dmabuf) -> bool>>,
+    /// The nested (winit) session's renderer, for close snapshots taken between redraws
+    /// (`backend::capture_live_snapshot_for_close`).
+    pub winit_backend: Option<
+        std::rc::Rc<
+            std::cell::RefCell<
+                smithay::backend::winit::WinitGraphicsBackend<
+                    smithay::backend::renderer::gles::GlesRenderer,
+                >,
+            >,
+        >,
+    >,
     /// `linux-drm-syncobj-v1` (explicit sync). `None` when the primary GPU cannot wait on
     /// syncobj timelines. Without this, drivers that provide no implicit dma-buf fences (the
     /// NVIDIA proprietary driver) let the compositor sample a client buffer before the client
@@ -402,6 +422,10 @@ pub struct ShojiWM {
     pub damage_blink_capture_suppression: HashMap<String, u8>,
     pub runtime_poll_dirty: bool,
     pub runtime_dirty_window_ids: std::collections::HashSet<String>,
+    /// Windows marked dirty while a decoration refresh pass runs (by a host
+    /// message it drains, say): the pass must not clear them with the
+    /// windows it processed earlier, or their changes are never refreshed.
+    pub runtime_dirty_marked_during_refresh: Option<std::collections::HashSet<String>>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_node_only_window_ids: std::collections::HashSet<String>,
     pub runtime_scheduler_enabled: bool,
@@ -461,6 +485,8 @@ pub struct ShojiWM {
     pub runtime_process_entries: BTreeMap<String, RuntimeProcessEntry>,
     pub runtime_process_once_runs: HashMap<String, u64>,
     pub runtime_process_suppressed_services: HashMap<String, u64>,
+    pub runtime_process_spawn_backoff: HashMap<String, crate::runtime_process::ServiceSpawnBackoff>,
+    pub runtime_process_last_refresh_at: Option<Instant>,
     pub runtime_managed_services: BTreeMap<String, ManagedRuntimeService>,
     // Fire-and-forget children (Once/spawn) that aren't tracked anywhere
     // else. We don't need their exit status, just to reap them so they
@@ -489,8 +515,13 @@ pub struct ShojiWM {
     pub runtime_libinput_devices: HashMap<String, input::Device>,
     pub runtime_pointer_move_enabled: bool,
     pub runtime_pointer_move_async_enabled: bool,
+    pub pointer_dispatch: crate::pointer_dispatch::PointerDispatchQueue,
     pub runtime_gesture_swipe_enabled: bool,
     pub runtime_gesture_swipe_async_enabled: bool,
+    /// The config listens to touchpad pinches; the fingers of the one in
+    /// progress.
+    pub runtime_gesture_pinch_async_enabled: bool,
+    pub runtime_gesture_pinch_fingers: u32,
     /// The config listens to drag and drop (`COMPOSITOR.dnd.event.onStart`).
     pub runtime_dnd_enabled: bool,
     /// The drag in progress and the drag views the config shows.
@@ -501,13 +532,8 @@ pub struct ShojiWM {
     /// A key the grab took inside the keyboard filter, dispatched right after.
     pub pending_input_grab_key_event: Option<crate::runtime_input_grab::InputGrabEventSnapshot>,
     pub current_keyboard_modifiers: ModifiersState,
-    // Modifier-only tap detection (e.g. "Super"). If no other input occurs
-    // between press and release, the release is treated as a tap.
-    pub tap_pressed_keys: u32,
-    pub tap_armed_modifier: Option<crate::runtime_key_binding::ModifierClass>,
-    pub tap_interrupted: bool,
-    /// Event time (ms) the tap modifier was pressed, for `within`.
-    pub tap_armed_at: u32,
+    pub consumed_pointer_buttons: HashSet<(String, u32)>,
+    pub modifier_tap: crate::modifier_tap::ModifierTapTracker,
     pub pending_tap_binding_ids: Vec<String>,
     pub suggested_window_offset: Option<(i32, i32)>,
     pub async_asset_dirty: bool,
@@ -673,7 +699,10 @@ pub struct ShojiWM {
     pub xwayland_refresh_override_mhz: Arc<AtomicI32>,
 }
 
-pub(crate) fn logical_rect_intersects_output(rect: LogicalRect, output_geo: Rectangle<i32, Logical>) -> bool {
+pub(crate) fn logical_rect_intersects_output(
+    rect: LogicalRect,
+    output_geo: Rectangle<i32, Logical>,
+) -> bool {
     let left = rect.x.max(output_geo.loc.x);
     let top = rect.y.max(output_geo.loc.y);
     let right = (rect.x + rect.width).min(output_geo.loc.x + output_geo.size.w);
@@ -693,15 +722,12 @@ struct DetectedSubpixel(smithay::output::Subpixel);
 
 fn detected_subpixel(output: &Output) -> smithay::output::Subpixel {
     let user_data = output.user_data();
-    user_data.insert_if_missing_threadsafe(|| {
-        DetectedSubpixel(output.physical_properties().subpixel)
-    });
     user_data
-        .get::<DetectedSubpixel>()
-        .map_or_else(
-            || output.physical_properties().subpixel,
-            |detected| detected.0,
-        )
+        .insert_if_missing_threadsafe(|| DetectedSubpixel(output.physical_properties().subpixel));
+    user_data.get::<DetectedSubpixel>().map_or_else(
+        || output.physical_properties().subpixel,
+        |detected| detected.0,
+    )
 }
 
 /// A frame ticks the runtime for work due within this much past its presentation time;
@@ -721,7 +747,7 @@ impl ShojiWM {
         (rank, output_name.to_string())
     }
 
-    fn runtime_frame_sync_interval_ms(&self) -> u64 {
+    pub(crate) fn runtime_frame_sync_interval_ms(&self) -> u64 {
         self.space
             .outputs()
             .filter_map(|output| {
@@ -782,6 +808,18 @@ impl ShojiWM {
         let output = self.space.outputs().next().cloned();
         if let Some(output) = output {
             self.warp_cursor_to_output_center(&output);
+        }
+    }
+
+    /// The only writer of `session_lock_active` after construction: it also
+    /// updates the copy `lock_scene` keeps for the runtime threads (unlock
+    /// overlay creation), which must never disagree with it.
+    pub(crate) fn set_session_lock_active(&mut self, active: bool) {
+        self.session_lock_active = active;
+        crate::backend::lock_scene::set_locked(active);
+        // The releases of the keys down now go to the locker.
+        if active {
+            self.modifier_tap.reset();
         }
     }
 
@@ -970,10 +1008,11 @@ impl ShojiWM {
             });
 
         if let Some(keyboard) = self.seat.get_keyboard()
-            && keyboard.current_focus().as_ref() != focus.as_ref() {
-                self.publish_xwayland_positions();
-                keyboard.set_focus(self, focus, serial);
-            }
+            && keyboard.current_focus().as_ref() != focus.as_ref()
+        {
+            self.publish_xwayland_positions();
+            keyboard.set_focus(self, focus, serial);
+        }
     }
 
     fn window_root_surface(window: &Window) -> Option<WlSurface> {
@@ -1071,10 +1110,11 @@ impl ShojiWM {
             && matches!(
                 layer.cached_state().keyboard_interactivity,
                 smithay::wayland::shell::wlr_layer::KeyboardInteractivity::OnDemand
-            ) {
-                self.layer_shell_on_demand_focus = Some(layer);
-                return;
-            }
+            )
+        {
+            self.layer_shell_on_demand_focus = Some(layer);
+            return;
+        }
 
         self.layer_shell_on_demand_focus = None;
     }
@@ -1120,8 +1160,7 @@ impl ShojiWM {
     }
 
     fn window_was_used_by_user(&self, window: &Window) -> bool {
-        Self::window_root_surface(window)
-            .is_some_and(|root| self.focus_chain.contains(&root))
+        Self::window_root_surface(window).is_some_and(|root| self.focus_chain.contains(&root))
     }
 
     /// Record that the user acted on `window`: a pointer press on it, a key
@@ -1497,6 +1536,22 @@ impl ShojiWM {
         }
     }
 
+    /// [`Self::update_keyboard_focus`] for when the role object of `surface` has just been
+    /// destroyed. When a whole client goes away, libwayland destroys its objects in id order, so
+    /// the surface can already be dead while the client's `wl_keyboard` is still alive; taking the
+    /// focus from it then sends `wl_keyboard.leave` naming a dead object, which wayland-backend
+    /// panics on inside the destructor, aborting the compositor. Once the client is gone its
+    /// keyboards are gone too, so in that case the focus moves after this dispatch.
+    pub fn update_keyboard_focus_after_destroy(&mut self, surface: &WlSurface) {
+        if surface.alive() {
+            self.update_keyboard_focus(SERIAL_COUNTER.next_serial());
+        } else {
+            self.loop_handle.insert_idle(|state| {
+                state.update_keyboard_focus(SERIAL_COUNTER.next_serial());
+            });
+        }
+    }
+
     fn should_defer_initial_keyboard_focus(&self, focus: Option<&WlSurface>) -> bool {
         if self.pending_initial_focus_window_ids.is_empty() {
             return false;
@@ -1562,14 +1617,20 @@ impl ShojiWM {
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
-        // The legacy KDE protocol announces this default when a client binds
-        // the manager, before any per-window metadata exists. Advertising
-        // Server here makes Firefox/Chromium construct an undecorated window
-        // up front, and some versions do not rebuild their full CSD after a
-        // later per-window Client response. Start from the Wayland-safe CSD
-        // baseline; COMPOSITOR.window.decoration.configure can still request
-        // SSD for each decoration object once the window is known.
-        let kde_decoration_state = KdeDecorationState::new::<Self>(&dh, KdeDecorationMode::Client);
+        // The legacy KDE protocol announces a default mode when a client
+        // binds the manager, before it has any window. Smithay's global sends
+        // one default to everyone, so it stays hidden; ShojiWM's own global
+        // (`KdeDecorationManagerGlobal`) asks the config per client instead
+        // and falls back to the CSD baseline. Smithay still handles requests
+        // on the bound manager and its decoration objects.
+        let kde_decoration_state =
+            KdeDecorationState::new_with_filter::<Self, _>(&dh, KdeDecorationMode::Client, |_| {
+                false
+            });
+        dh.create_global::<Self, OrgKdeKwinServerDecorationManager, _>(
+            1,
+            crate::window_decoration::KdeDecorationManagerGlobal,
+        );
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let popups = PopupManager::default();
         let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&dh);
@@ -1668,7 +1729,11 @@ impl ShojiWM {
         let config_error_report = match config_runtime.preload() {
             Ok(()) => None,
             Err(error) => {
-                warn!(?error, runtime = config_runtime.name(), "failed to preload config");
+                warn!(
+                    ?error,
+                    runtime = config_runtime.name(),
+                    "failed to preload config"
+                );
                 Some(crate::config_error::ConfigErrorReport::initial_load(error))
             }
         };
@@ -1694,12 +1759,9 @@ impl ShojiWM {
                             height,
                             pixels,
                         } => {
-                            state.text_rasterizer.handle_async_ready(
-                                spec_hash,
-                                width,
-                                height,
-                                pixels,
-                            );
+                            state
+                                .text_rasterizer
+                                .handle_async_ready(spec_hash, width, height, pixels);
                             should_redraw = true;
                         }
                         AsyncAssetResult::TextMissing { spec_hash } => {
@@ -1711,12 +1773,9 @@ impl ShojiWM {
                             height,
                             pixels,
                         } => {
-                            state.icon_rasterizer.handle_async_ready(
-                                spec_hash,
-                                width,
-                                height,
-                                pixels,
-                            );
+                            state
+                                .icon_rasterizer
+                                .handle_async_ready(spec_hash, width, height, pixels);
                             should_redraw = true;
                         }
                         AsyncAssetResult::IconMissing { spec_hash } => {
@@ -1733,8 +1792,8 @@ impl ShojiWM {
             })
             .expect("Failed to init async asset worker.");
 
-        
-
+        // Mirrors `session_lock_active` below; see `set_session_lock_active`.
+        crate::backend::lock_scene::set_locked(runtime.start_locked());
         Self {
             start_time,
             display_handle: dh,
@@ -1779,7 +1838,11 @@ impl ShojiWM {
             idle_inhibited_surfaces: Vec::new(),
             active_idle_inhibit_labels: Vec::new(),
             session_lock_state,
-            session_lock_active: false,
+            // Started locked (a login screen made of the lock screen): only
+            // lock surfaces are drawn until a locker locks and unlocks.
+            session_lock_active: runtime.start_locked(),
+            session_locker: None,
+            initial_config_enabled: false,
             session_lock_surfaces: HashMap::new(),
             image_copy_capture_sessions: std::collections::HashMap::new(),
             image_copy_capture_pending: Vec::new(),
@@ -1824,6 +1887,7 @@ impl ShojiWM {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             winit_dmabuf_import: None,
+            winit_backend: None,
             drm_syncobj_state: None,
             implicit_sync_trusted: false,
             background_effect_state,
@@ -1833,6 +1897,7 @@ impl ShojiWM {
             damage_blink_capture_suppression: HashMap::new(),
             runtime_poll_dirty: false,
             runtime_dirty_window_ids: Default::default(),
+            runtime_dirty_marked_during_refresh: None,
             runtime_managed_only_window_ids: Default::default(),
             runtime_node_only_window_ids: Default::default(),
             runtime_scheduler_enabled: false,
@@ -1865,6 +1930,8 @@ impl ShojiWM {
             runtime_process_entries: Default::default(),
             runtime_process_once_runs: Default::default(),
             runtime_process_suppressed_services: Default::default(),
+            runtime_process_spawn_backoff: Default::default(),
+            runtime_process_last_refresh_at: None,
             runtime_managed_services: Default::default(),
             runtime_pending_reap: Default::default(),
             runtime_key_binding_entries: Default::default(),
@@ -1883,18 +1950,19 @@ impl ShojiWM {
             runtime_libinput_devices: Default::default(),
             runtime_pointer_move_enabled: false,
             runtime_pointer_move_async_enabled: false,
+            pointer_dispatch: Default::default(),
             runtime_gesture_swipe_enabled: false,
             runtime_gesture_swipe_async_enabled: false,
+            runtime_gesture_pinch_async_enabled: false,
+            runtime_gesture_pinch_fingers: 0,
             runtime_dnd_enabled: false,
             dnd: Default::default(),
             runtime_gesture_swipe: None,
             runtime_input_grab: None,
             pending_input_grab_key_event: None,
             current_keyboard_modifiers: ModifiersState::default(),
-            tap_pressed_keys: 0,
-            tap_armed_modifier: None,
-            tap_interrupted: false,
-            tap_armed_at: 0,
+            consumed_pointer_buttons: HashSet::new(),
+            modifier_tap: Default::default(),
             pending_tap_binding_ids: Vec::new(),
             suggested_window_offset: None,
             async_asset_dirty: false,
@@ -2584,7 +2652,11 @@ impl ShojiWM {
                 return enabled;
             }
             let enabled = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(|dir| std::path::Path::new(&dir).join("shoji-motion-trace").exists())
+                .map(|dir| {
+                    std::path::Path::new(&dir)
+                        .join("shoji-motion-trace")
+                        .exists()
+                })
                 .unwrap_or(false);
             cache.set((Some(Instant::now()), enabled));
             enabled
@@ -2670,15 +2742,15 @@ impl ShojiWM {
         let generation = self.runtime_schedule_timer_generation;
         let now_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0;
         let delay = Duration::from_secs_f64((wake_at_ms - now_ms).max(0.0) / 1000.0);
-        let result = self
-            .loop_handle
-            .insert_source(Timer::from_duration(delay), move |_, _, state| {
-                state.record_event_source_wake("runtime-schedule");
-                if state.runtime_schedule_timer_generation == generation {
-                    state.run_runtime_schedule();
-                }
-                TimeoutAction::Drop
-            });
+        let result =
+            self.loop_handle
+                .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                    state.record_event_source_wake("runtime-schedule");
+                    if state.runtime_schedule_timer_generation == generation {
+                        state.run_runtime_schedule();
+                    }
+                    TimeoutAction::Drop
+                });
         if let Err(error) = result {
             debug!(?error, "failed to arm the runtime schedule timer");
         }
@@ -2699,9 +2771,10 @@ impl ShojiWM {
         // stays due on every tick; one tick per refresh period is as often as anything
         // could show it, and more would only spin the loop.
         let timer_wake = schedule.timer_due_ms.map(|due_ms| {
-            self.runtime_schedule_last_timer_tick_ms.map_or(due_ms, |last_ms| {
-                due_ms.max(last_ms + self.runtime_frame_sync_interval_ms() as f64)
-            })
+            self.runtime_schedule_last_timer_tick_ms
+                .map_or(due_ms, |last_ms| {
+                    due_ms.max(last_ms + self.runtime_frame_sync_interval_ms() as f64)
+                })
         });
         output_wakes.chain(timer_wake).min_by(f64::total_cmp)
     }
@@ -2775,7 +2848,7 @@ impl ShojiWM {
     /// `None` for a wall-clock timer tick.
     fn tick_runtime_scheduler_at(&mut self, force: bool, frame: Option<(&str, f64)>) -> u64 {
         let frame_time_ms = frame.map(|(_, time)| time);
-        self.sync_keyboard_layout();
+        self.sync_keyboard_state();
         self.refresh_runtime_processes();
         let managed_window_animation_active = !self.managed_window_animations.is_empty();
         if !force
@@ -2982,6 +3055,9 @@ impl ShojiWM {
             .insert_source(ping_source, |_, _, state| {
                 state.record_event_source_wake("runtime-host");
                 state.drain_runtime_host_messages();
+                if crate::backend::lock_scene::take_changed() {
+                    state.schedule_redraw();
+                }
                 state.tick_output_overlays();
                 state.schedule_output_overlay_tick();
                 if state.config_runtime.host().take_wake_request() {
@@ -3051,6 +3127,7 @@ impl ShojiWM {
                     }
                 }
                 HostMessage::DragView(command) => self.apply_drag_view_command(command),
+                HostMessage::StartLocked => self.start_session_locked(),
                 HostMessage::BackgroundEffect(config) => {
                     if self.configured_background_effect != config {
                         self.configured_background_effect = config;
@@ -3071,27 +3148,46 @@ impl ShojiWM {
         if self.output_overlays.is_idle() {
             return crate::backend::overlay::deadline_interval_ms();
         }
-        let outputs: Vec<_> = self.space.outputs()
-            .filter(|output| self.runtime_output_render_enabled(&output.name())).cloned().collect();
-        let unavailable = self.session_lock_active || (!self.tty_backends.is_empty() && !self.tty_session_active);
+        let outputs: Vec<_> = self
+            .space
+            .outputs()
+            .filter(|output| {
+                self.runtime_output_render_enabled(&output.name())
+                    && !self.powered_off_outputs.contains_key(&output.name())
+            })
+            .cloned()
+            .collect();
+        let unavailable =
+            self.session_lock_active || (!self.tty_backends.is_empty() && !self.tty_session_active);
+        if !self.tty_backends.is_empty() && !self.tty_session_active {
+            crate::backend::overlay::close_all("Session paused");
+        }
         if self.output_overlays.tick(&outputs, unavailable) {
             self.schedule_redraw();
-            self.runtime_frame_sync_interval_ms().min(crate::backend::overlay::deadline_interval_ms())
-        } else { crate::backend::overlay::deadline_interval_ms() }
+            self.runtime_frame_sync_interval_ms()
+                .min(crate::backend::overlay::deadline_interval_ms())
+        } else {
+            crate::backend::overlay::deadline_interval_ms()
+        }
     }
 
     fn schedule_output_overlay_tick(&mut self) {
-        if self.output_overlay_timer_active || !crate::backend::overlay::any() { return; }
+        if self.output_overlay_timer_active || !crate::backend::overlay::any() {
+            return;
+        }
         let interval = self.runtime_frame_sync_interval_ms();
-        let result = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(interval)), |_, _, state| {
-            let interval = state.tick_output_overlays();
-            if crate::backend::overlay::any() {
-                TimeoutAction::ToDuration(Duration::from_millis(interval))
-            } else {
-                state.output_overlay_timer_active = false;
-                TimeoutAction::Drop
-            }
-        });
+        let result = self.loop_handle.insert_source(
+            Timer::from_duration(Duration::from_millis(interval)),
+            |_, _, state| {
+                let interval = state.tick_output_overlays();
+                if crate::backend::overlay::any() {
+                    TimeoutAction::ToDuration(Duration::from_millis(interval))
+                } else {
+                    state.output_overlay_timer_active = false;
+                    TimeoutAction::Drop
+                }
+            },
+        );
         match result {
             Ok(_) => self.output_overlay_timer_active = true,
             Err(error) => {
@@ -3188,7 +3284,11 @@ impl ShojiWM {
     }
 
     fn report_hot_reload_error(&mut self, error: impl std::fmt::Debug + ToString) {
-        warn!(?error, runtime = self.config_runtime.name(), "failed to hot reload config");
+        warn!(
+            ?error,
+            runtime = self.config_runtime.name(),
+            "failed to hot reload config"
+        );
         self.config_error_report = Some(crate::config_error::ConfigErrorReport::hot_reload(error));
         self.schedule_redraw();
     }
@@ -3306,10 +3406,26 @@ impl ShojiWM {
         info!(runtime = self.config_runtime.name(), "hot reloaded config");
     }
 
+    /// `COMPOSITOR.session.startLocked`: lock before the first client runs.
+    /// Only the first config load gets here early enough (no client request
+    /// is dispatched before it); a hot reload must not lock a running session
+    /// with no locker in sight.
+    fn start_session_locked(&mut self) {
+        if self.initial_config_enabled {
+            info!("startLocked only applies when the compositor starts; ignored on reload");
+            return;
+        }
+        if !self.session_lock_active {
+            info!("session starts locked (config)");
+            self.set_session_lock_active(true);
+        }
+    }
+
     pub fn enable_initial_decoration_runtime(&mut self) {
         self.sync_runtime_display_state();
         let lifecycle_result = self.config_runtime.enable();
         self.drain_runtime_host_messages();
+        self.initial_config_enabled = true;
         if let Err(error) = lifecycle_result {
             warn!(?error, "failed to run initial config lifecycle");
             self.config_error_report =
@@ -3349,29 +3465,28 @@ impl ShojiWM {
                 // Prefer the DRM-backed list, which still carries each mode's
                 // pixel clock; fall back to the wl_output modes (no clock) for
                 // backends with no DRM behind them.
-                let available_modes = match crate::backend::tty::
-                    tty_output_available_mode_clocks(self, &name)
-                {
-                    Some(modes) => modes
-                        .into_iter()
-                        .map(|(mode, clock_khz)| OutputModeSnapshot {
-                            width: mode.size.w,
-                            height: mode.size.h,
-                            refresh_rate: mode.refresh as f64 / 1000.0,
-                            clock_khz: Some(clock_khz),
-                        })
-                        .collect::<Vec<_>>(),
-                    None => tty_output_available_modes(self, &name)
-                        .unwrap_or_else(|| output.modes())
-                        .into_iter()
-                        .map(|mode| OutputModeSnapshot {
-                            width: mode.size.w,
-                            height: mode.size.h,
-                            refresh_rate: mode.refresh as f64 / 1000.0,
-                            clock_khz: None,
-                        })
-                        .collect::<Vec<_>>(),
-                };
+                let available_modes =
+                    match crate::backend::tty::tty_output_available_mode_clocks(self, &name) {
+                        Some(modes) => modes
+                            .into_iter()
+                            .map(|(mode, clock_khz)| OutputModeSnapshot {
+                                width: mode.size.w,
+                                height: mode.size.h,
+                                refresh_rate: mode.refresh as f64 / 1000.0,
+                                clock_khz: Some(clock_khz),
+                            })
+                            .collect::<Vec<_>>(),
+                        None => tty_output_available_modes(self, &name)
+                            .unwrap_or_else(|| output.modes())
+                            .into_iter()
+                            .map(|mode| OutputModeSnapshot {
+                                width: mode.size.w,
+                                height: mode.size.h,
+                                refresh_rate: mode.refresh as f64 / 1000.0,
+                                clock_khz: None,
+                            })
+                            .collect::<Vec<_>>(),
+                    };
                 // Report the mode size in the output's transformed orientation
                 // so config-side logical-size math (`resolution / scale`) stays
                 // correct on rotated outputs. `availableModes` stay physical.
@@ -3408,20 +3523,16 @@ impl ShojiWM {
                         detected_subpixel: detected_subpixel(&output).into(),
                         hdr_supported: self
                             .output_color
-                            .get(
-                                &name,
-                            )
+                            .get(&name)
                             .is_some_and(|color| color.edid_hdr.is_some()),
                         hdmi: self
                             .output_color
                             .get(&name)
                             .and_then(|color| color.hdmi_link)
-                            .map(|link| {
-                                crate::ssd::HdmiLinkSnapshot {
-                                    standard: link.standard(),
-                                    max_tmds_khz: link.max_tmds_khz,
-                                    max_bandwidth_gbps: link.max_bandwidth_gbps(),
-                                }
+                            .map(|link| crate::ssd::HdmiLinkSnapshot {
+                                standard: link.standard(),
+                                max_tmds_khz: link.max_tmds_khz,
+                                max_bandwidth_gbps: link.max_bandwidth_gbps(),
                             }),
                     },
                 )
@@ -3597,7 +3708,9 @@ impl ShojiWM {
 
         let mut extend_output_names = outputs
             .iter()
-            .filter(|&output| self.runtime_output_mode_setting(&output.name()) == RuntimeOutputMode::Extend)
+            .filter(|&output| {
+                self.runtime_output_mode_setting(&output.name()) == RuntimeOutputMode::Extend
+            })
             .map(|output| output.name())
             .collect::<std::collections::BTreeSet<_>>();
         if extend_output_names.is_empty()
@@ -3990,6 +4103,7 @@ impl ShojiWM {
         self.runtime_pointer_move_async_enabled = update.pointer_move_async;
         self.runtime_gesture_swipe_enabled = update.gesture_swipe;
         self.runtime_gesture_swipe_async_enabled = update.gesture_swipe_async;
+        self.runtime_gesture_pinch_async_enabled = update.gesture_pinch_async;
     }
 
     pub fn consume_runtime_event_config(&mut self, update: Option<RuntimeEventConfigUpdate>) {
@@ -4076,6 +4190,9 @@ impl ShojiWM {
             } else {
                 self.runtime_node_only_window_ids.remove(&window_id);
             }
+            if let Some(marked) = &mut self.runtime_dirty_marked_during_refresh {
+                marked.insert(window_id.clone());
+            }
             self.runtime_dirty_window_ids.insert(window_id);
         }
     }
@@ -4147,11 +4264,18 @@ impl ShojiWM {
     pub fn apply_runtime_process_config_update(&mut self, update: RuntimeProcessConfigUpdate) {
         self.runtime_process_config_generation =
             self.runtime_process_config_generation.saturating_add(1);
-        self.runtime_process_entries = update
-            .entries
-            .into_iter()
-            .map(|entry| (entry.id().to_string(), entry))
-            .collect();
+        let previous_entries = std::mem::replace(
+            &mut self.runtime_process_entries,
+            update
+                .entries
+                .into_iter()
+                .map(|entry| (entry.id().to_string(), entry))
+                .collect(),
+        );
+        // A service the config changed gets a fresh attempt.
+        let entries = &self.runtime_process_entries;
+        self.runtime_process_spawn_backoff
+            .retain(|id, _| previous_entries.get(id) == entries.get(id));
         self.reconcile_runtime_processes();
     }
 
@@ -4177,6 +4301,18 @@ impl ShojiWM {
     }
 
     pub fn refresh_runtime_processes(&mut self) {
+        // The scheduler ticks once per frame while anything animates, but children do not
+        // need looking after that often: a service that keeps failing would be respawned
+        // on the main thread at the refresh rate.
+        const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+        if self
+            .runtime_process_last_refresh_at
+            .is_some_and(|at| at.elapsed() < REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.runtime_process_last_refresh_at = Some(Instant::now());
+
         let service_ids = self
             .runtime_managed_services
             .keys()
@@ -4226,14 +4362,15 @@ impl ShojiWM {
         // Reap fire-and-forget Once/spawn children as they exit. We don't
         // care about their exit status, just that they don't sit around as
         // zombies — same try_wait() polling as the Service loop above.
-        self.runtime_pending_reap.retain_mut(|child| match child.try_wait() {
-            Ok(Some(_status)) => false,
-            Ok(None) => true,
-            Err(error) => {
-                warn!(?error, "failed to poll fire-and-forget runtime process");
-                false
-            }
-        });
+        self.runtime_pending_reap
+            .retain_mut(|child| match child.try_wait() {
+                Ok(Some(_status)) => false,
+                Ok(None) => true,
+                Err(error) => {
+                    warn!(?error, "failed to poll fire-and-forget runtime process");
+                    false
+                }
+            });
 
         self.reconcile_runtime_processes();
     }
@@ -4274,9 +4411,10 @@ impl ShojiWM {
 
             if should_remove || should_restart {
                 if let Some(mut service) = self.runtime_managed_services.remove(&service_id)
-                    && let Err(error) = kill_runtime_service(&mut service) {
-                        warn!(?error, service_id, "failed to stop runtime service");
-                    }
+                    && let Err(error) = kill_runtime_service(&mut service)
+                {
+                    warn!(?error, service_id, "failed to stop runtime service");
+                }
                 self.runtime_process_suppressed_services.remove(&service_id);
             }
         }
@@ -4351,9 +4489,18 @@ impl ShojiWM {
                     {
                         continue;
                     }
+                    let now = Instant::now();
+                    if self
+                        .runtime_process_spawn_backoff
+                        .get(&service_id)
+                        .is_some_and(|backoff| !backoff.is_due(now))
+                    {
+                        continue;
+                    }
 
                     match spawn_runtime_process(launch, cwd.as_deref(), env) {
                         Ok(child) => {
+                            self.runtime_process_spawn_backoff.remove(&service_id);
                             self.runtime_process_suppressed_services.remove(&service_id);
                             self.runtime_managed_services.insert(
                                 service_id.clone(),
@@ -4366,7 +4513,25 @@ impl ShojiWM {
                             info!(process_id = %service_id, "started runtime managed service");
                         }
                         Err(error) => {
-                            warn!(?error, process_id = %service_id, "failed to start runtime managed service");
+                            let backoff = self
+                                .runtime_process_spawn_backoff
+                                .get(&service_id)
+                                .map_or_else(
+                                    || {
+                                        crate::runtime_process::ServiceSpawnBackoff::first_failure(
+                                            now,
+                                        )
+                                    },
+                                    |backoff| backoff.next_failure(now),
+                                );
+                            self.runtime_process_spawn_backoff
+                                .insert(service_id.clone(), backoff);
+                            warn!(
+                                ?error,
+                                process_id = %service_id,
+                                retry_in_secs = backoff.delay().as_secs(),
+                                "failed to start runtime managed service"
+                            );
                         }
                     }
                 }
@@ -4778,7 +4943,11 @@ impl ShojiWM {
         let root_surface = window
             .toplevel()
             .map(|surface| surface.wl_surface().clone())
-            .or_else(|| window.x11_surface().and_then(|surface| surface.wl_surface()));
+            .or_else(|| {
+                window
+                    .x11_surface()
+                    .and_then(|surface| surface.wl_surface())
+            });
         let Some(root_surface) = root_surface else {
             return true;
         };
@@ -4955,11 +5124,14 @@ impl ShojiWM {
     /// Whether some output's composition drew `window` by id last frame.
     pub fn window_drawn_by_composition(&self, window: &Window) -> bool {
         !self.composition_windows.is_empty()
-            && self.window_decorations.get(window).is_some_and(|decoration| {
-                self.composition_windows
-                    .values()
-                    .any(|ids| ids.contains(&decoration.snapshot.id))
-            })
+            && self
+                .window_decorations
+                .get(window)
+                .is_some_and(|decoration| {
+                    self.composition_windows
+                        .values()
+                        .any(|ids| ids.contains(&decoration.snapshot.id))
+                })
     }
 
     fn sorted_windows_top_to_bottom<'a, I>(&self, windows: I) -> Vec<&'a Window>
@@ -5245,19 +5417,20 @@ impl ShojiWM {
 
     pub fn note_xdg_popup_committed(&mut self, surface_id: u32) {
         if let Some(popup_debug) = self.popup_latency_debug.as_mut()
-            && popup_debug.surface_id == surface_id {
-                popup_debug.committed_at = Some(Duration::from(self.clock.now()));
-                if crate::env_flag!("SHOJI_XDG_POPUP_LATENCY_DEBUG") {
-                    tracing::info!(
-                        surface_id,
-                        created_to_commit_ms = popup_debug
-                            .committed_at
-                            .and_then(|commit| commit.checked_sub(popup_debug.created_at))
-                            .map(|delta| delta.as_secs_f64() * 1000.0),
-                        "xdg popup latency: committed"
-                    );
-                }
+            && popup_debug.surface_id == surface_id
+        {
+            popup_debug.committed_at = Some(Duration::from(self.clock.now()));
+            if crate::env_flag!("SHOJI_XDG_POPUP_LATENCY_DEBUG") {
+                tracing::info!(
+                    surface_id,
+                    created_to_commit_ms = popup_debug
+                        .committed_at
+                        .and_then(|commit| commit.checked_sub(popup_debug.created_at))
+                        .map(|delta| delta.as_secs_f64() * 1000.0),
+                    "xdg popup latency: committed"
+                );
             }
+        }
     }
 
     fn popup_kind_name(popup: &PopupKind) -> &'static str {
@@ -5812,11 +5985,7 @@ impl WaylandClientIdentity {
         };
 
         let mut byte = [0_u8; 1];
-        let peer_state = match recv(
-            socket,
-            &mut byte,
-            RecvFlags::PEEK | RecvFlags::DONTWAIT,
-        ) {
+        let peer_state = match recv(socket, &mut byte, RecvFlags::PEEK | RecvFlags::DONTWAIT) {
             Ok((_, 0)) => "peer-closed".to_owned(),
             Ok((_, count)) => format!("peer-open-pending-data:{count}"),
             Err(error) if error == smithay::reexports::rustix::io::Errno::AGAIN => {
@@ -5898,7 +6067,7 @@ mod wayland_client_identity_tests {
 #[cfg(test)]
 mod subpixel_latch_tests {
     use super::detected_subpixel;
-    use crate::config::{resolve_output_subpixel, RuntimeOutputSubpixel};
+    use crate::config::{RuntimeOutputSubpixel, resolve_output_subpixel};
     use smithay::output::{Output, PhysicalProperties, Subpixel};
 
     fn output_with_detected(subpixel: Subpixel) -> Output {

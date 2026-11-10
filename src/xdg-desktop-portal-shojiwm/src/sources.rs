@@ -18,6 +18,7 @@
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iced::widget::image;
@@ -42,10 +43,16 @@ use wayland_protocols::ext::image_copy_capture::v1::client::{
 
 const MAX_THUMBNAIL_DIM: u32 = 320;
 
+pub mod source_types {
+    pub const MONITOR: u32 = 1;
+    pub const WINDOW: u32 = 2;
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
     pub name: String,
     pub description: String,
+    pub position: (i32, i32),
     /// Current mode dimensions in hardware (untransformed) orientation, as
     /// sent by `wl_output.mode`.
     pub width: i32,
@@ -124,10 +131,12 @@ impl SourceInfo {
     pub fn detail(&self) -> String {
         match &self.kind {
             SourceKind::Output(o) => format!(
-                "{}×{} @ {:.2}Hz",
+                "{}×{} @ {:.2}Hz · ({}, {})",
                 o.width,
                 o.height,
-                o.refresh_mhz as f64 / 1000.0
+                o.refresh_mhz as f64 / 1000.0,
+                o.position.0,
+                o.position.1,
             ),
             SourceKind::Toplevel(t) => {
                 if t.identifier.is_empty() {
@@ -144,8 +153,10 @@ impl SourceInfo {
 // ---------------------------------------------------------------------------
 
 struct DiscoveredOutput {
+    global_name: u32,
     proxy: wl_output::WlOutput,
     info: OutputInfo,
+    pending: OutputInfo,
 }
 
 struct DiscoveredToplevel {
@@ -156,7 +167,6 @@ struct DiscoveredToplevel {
 #[derive(Default)]
 struct DiscoveryState {
     outputs: Vec<DiscoveredOutput>,
-    output_pending: Vec<OutputInfo>,
     toplevels: Vec<DiscoveredToplevel>,
     toplevel_index: std::collections::HashMap<u32, usize>,
 
@@ -194,6 +204,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        if let wl_registry::Event::GlobalRemove { name } = event {
+            _app.state.lock().unwrap().outputs.retain(|output| {
+                if output.global_name != name {
+                    return true;
+                }
+                if output.proxy.version() >= 3 {
+                    output.proxy.release();
+                }
+                false
+            });
+            return;
+        }
         let wl_registry::Event::Global {
             name,
             interface,
@@ -204,7 +226,23 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
         };
         match interface.as_str() {
             "wl_output" => {
-                registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
+                let proxy =
+                    registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
+                let info = OutputInfo {
+                    name: String::new(),
+                    description: String::new(),
+                    position: (0, 0),
+                    width: 0,
+                    height: 0,
+                    refresh_mhz: 0,
+                    transform: wl_output::Transform::Normal,
+                };
+                _app.state.lock().unwrap().outputs.push(DiscoveredOutput {
+                    global_name: name,
+                    proxy,
+                    pending: info.clone(),
+                    info,
+                });
             }
             "wl_shm" => {
                 let shm = registry.bind::<wl_shm::WlShm, _, _>(name, version.min(1), qh, ());
@@ -255,24 +293,25 @@ impl Dispatch<wl_output::WlOutput, ()> for AppData {
         _: &QueueHandle<Self>,
     ) {
         let mut state = app.state.lock().unwrap();
-        if state.output_pending.is_empty() {
-            state.output_pending.push(OutputInfo {
-                name: String::new(),
-                description: String::new(),
-                width: 0,
-                height: 0,
-                refresh_mhz: 0,
-                transform: wl_output::Transform::Normal,
-            });
-        }
-        let cur = state.output_pending.last_mut().unwrap();
+        let Some(entry) = state
+            .outputs
+            .iter_mut()
+            .find(|entry| &entry.proxy == output)
+        else {
+            return;
+        };
+        let cur = &mut entry.pending;
         match event {
             wl_output::Event::Name { name } => cur.name = name,
             wl_output::Event::Description { description } => cur.description = description,
             wl_output::Event::Geometry {
-                transform: WEnum::Value(transform),
-                ..
-            } => cur.transform = transform,
+                x, y, transform, ..
+            } => {
+                cur.position = (x, y);
+                if let WEnum::Value(transform) = transform {
+                    cur.transform = transform;
+                }
+            }
             wl_output::Event::Mode {
                 flags,
                 width,
@@ -288,11 +327,7 @@ impl Dispatch<wl_output::WlOutput, ()> for AppData {
                 cur.refresh_mhz = refresh;
             }
             wl_output::Event::Done => {
-                let info = state.output_pending.pop().unwrap();
-                state.outputs.push(DiscoveredOutput {
-                    proxy: output.clone(),
-                    info,
-                });
+                entry.info = entry.pending.clone();
             }
             _ => {}
         }
@@ -360,6 +395,7 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for AppData {
                         }
                     }
                 }
+                proxy.destroy();
             }
             _ => {}
         }
@@ -524,12 +560,9 @@ fn capture_via_source(
         }
         (c.constraint_width, c.constraint_height, c.constraint_format)
     };
-    if width == 0 || height == 0 {
-        return None;
-    }
     let format = format.unwrap_or(wl_shm::Format::Xrgb8888);
-    let (stride, _) = shm_layout(width, height)?;
-    let buffer = allocate_shm_buffer(app, qh, width, height, stride, format)?;
+    let layout = shm_layout(width, height)?;
+    let buffer = allocate_shm_buffer(app, qh, layout, format)?;
 
     let frame = ProtocolGuard::new(
         session.create_frame(qh, ()),
@@ -627,7 +660,9 @@ impl ShmMapping {
         .ok()?;
         let Some(ptr) = NonNull::new(raw.cast::<u8>()) else {
             unsafe {
-                let _ = rustix::mm::munmap(raw, size);
+                if let Err(error) = rustix::mm::munmap(raw, size) {
+                    tracing::warn!(%error, "failed to unmap thumbnail buffer");
+                }
             }
             return None;
         };
@@ -637,54 +672,76 @@ impl ShmMapping {
 
 impl Drop for ShmMapping {
     fn drop(&mut self) {
-        unsafe {
-            let _ = rustix::mm::munmap(self.ptr.as_ptr().cast(), self.size);
+        if let Err(error) = unsafe { rustix::mm::munmap(self.ptr.as_ptr().cast(), self.size) } {
+            tracing::warn!(%error, "failed to unmap thumbnail buffer");
         }
     }
 }
 
+// Fields drop in declaration order: release the protocol objects before the mapping.
 struct ShmBuffer {
     buffer: ProtocolGuard<wl_buffer::WlBuffer>,
+    _pool: ProtocolGuard<wl_shm_pool::WlShmPool>,
     mapping: ShmMapping,
 }
 
-fn shm_layout(width: u32, height: u32) -> Option<(i32, usize)> {
-    if width == 0 || height == 0 || height > i32::MAX as u32 {
+#[derive(Debug, PartialEq, Eq)]
+struct ShmLayout {
+    width: i32,
+    height: i32,
+    stride: i32,
+    size: usize,
+}
+
+/// Validate every size once, before allocating or passing signed dimensions to Wayland.
+fn shm_layout(width: u32, height: u32) -> Option<ShmLayout> {
+    if width == 0 || height == 0 {
         return None;
     }
     let stride = i32::try_from(width.checked_mul(4)?).ok()?;
-    let size = usize::try_from(stride).ok()?.checked_mul(height as usize)?;
-    if size > i32::MAX as usize {
-        return None;
-    }
-    Some((stride, size))
+    let width = i32::try_from(width).ok()?;
+    let height = i32::try_from(height).ok()?;
+    let size = usize::try_from(stride)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    i32::try_from(size).ok()?;
+    Some(ShmLayout {
+        width,
+        height,
+        stride,
+        size,
+    })
 }
 
 fn allocate_shm_buffer(
     app: &mut AppData,
     qh: &QueueHandle<AppData>,
-    width: u32,
-    height: u32,
-    stride: i32,
+    layout: ShmLayout,
     format: wl_shm::Format,
 ) -> Option<ShmBuffer> {
     let shm = app.state.lock().unwrap().shm.clone()?;
-    let (expected_stride, size) = shm_layout(width, height)?;
-    if stride != expected_stride {
-        return None;
-    }
-    let mapping = ShmMapping::new(size)?;
+    let mapping = ShmMapping::new(layout.size)?;
     let pool = ProtocolGuard::new(
-        shm.create_pool(mapping.fd.as_fd(), size as i32, qh, ()),
+        shm.create_pool(mapping.fd.as_fd(), layout.size as i32, qh, ()),
         wl_shm_pool::WlShmPool::destroy,
     );
     let buffer = ProtocolGuard::new(
-        pool.create_buffer(0, width as i32, height as i32, stride, format, qh, ()),
+        pool.create_buffer(
+            0,
+            layout.width,
+            layout.height,
+            layout.stride,
+            format,
+            qh,
+            (),
+        ),
         wl_buffer::WlBuffer::destroy,
     );
-    // wl_buffer retains the server-side storage; the pool object is no longer needed.
-    drop(pool);
-    Some(ShmBuffer { buffer, mapping })
+    Some(ShmBuffer {
+        buffer,
+        _pool: pool,
+        mapping,
+    })
 }
 
 /// Convert the BGRx / ARGB SHM buffer into an iced RGBA image, downscaled to
@@ -739,27 +796,80 @@ unsafe fn decode_buffer(
 // Live refresh ("Lv.2")
 // ---------------------------------------------------------------------------
 
-/// A single thumbnail update pushed by the background thread.
+/// One SelectSources attempt, distinct from its reusable portal session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SelectionRequestId(u64);
+
+impl SelectionRequestId {
+    pub fn unique() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// A current source list, including the latest available thumbnails.
 #[derive(Debug, Clone)]
-pub struct ThumbnailUpdate {
-    pub source_id: String,
-    pub handle: image::Handle,
+pub struct SourceUpdate {
+    pub session_key: String,
+    pub request_id: SelectionRequestId,
+    pub sources: Vec<SourceInfo>,
+}
+
+/// Shared cancellation state. Registering the socket and observing cancellation
+/// use the same lock so cancellation cannot miss a newly registered connection.
+#[derive(Default)]
+struct ThumbnailCancellation {
+    stop: AtomicBool,
+    socket: Mutex<Option<UnixStream>>,
+}
+
+impl ThumbnailCancellation {
+    fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn cancel(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(socket) = self.socket.lock().unwrap().as_ref() {
+            // Closing just the duplicate would not interrupt the worker's fd.
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn register(&self, conn: &Connection) -> std::io::Result<Option<SocketRegistration<'_>>> {
+        let duplicate = UnixStream::from(conn.as_fd().try_clone_to_owned()?);
+        let mut socket = self.socket.lock().unwrap();
+        if self.is_stopped() {
+            // Cancellation may have run before registration acquired the lock.
+            // Do not start a roundtrip on a connection that it could not interrupt.
+            return Ok(None);
+        }
+        *socket = Some(duplicate);
+        Ok(Some(SocketRegistration { cancellation: self }))
+    }
+}
+
+/// Clear the duplicate on every worker exit, including connection errors.
+struct SocketRegistration<'a> {
+    cancellation: &'a ThumbnailCancellation,
+}
+
+impl Drop for SocketRegistration<'_> {
+    fn drop(&mut self) {
+        self.cancellation.socket.lock().unwrap().take();
+    }
 }
 
 /// Handle to the background thumbnail-refresh thread. Drop it to stop.
 pub struct ThumbnailStream {
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    cancellation: Arc<ThumbnailCancellation>,
     join: Option<std::thread::JoinHandle<()>>,
-    socket: Arc<Mutex<Option<UnixStream>>>,
 }
 
 impl Drop for ThumbnailStream {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Interrupt a roundtrip even when the compositor stops responding.
-        if let Some(socket) = self.socket.lock().unwrap().as_ref() {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-        }
+        // Interrupt a blocked Wayland roundtrip before waiting for the worker.
+        self.cancellation.cancel();
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -769,7 +879,7 @@ impl Drop for ThumbnailStream {
 /// Spawn a background thread that:
 ///   1. enumerates all sources + captures their first thumbnail,
 ///   2. sends the initial `Vec<SourceInfo>` through `init_tx`,
-///   3. then round-robins through the sources, pushing fresh thumbnails on
+///   3. then round-robins through the sources, pushing current source lists on
 ///      `updates_tx` until the returned `ThumbnailStream` is dropped.
 ///
 /// One wayland Connection lives on the thread for its whole lifetime —
@@ -777,52 +887,52 @@ impl Drop for ThumbnailStream {
 /// `ext-image-copy-capture-v1` sessions are themselves not long-lived
 /// streaming primitives; they're billed per frame.
 pub fn start_thumbnail_stream(
+    session_key: String,
+    request_id: SelectionRequestId,
+    requested: u32,
     init_tx: tokio::sync::oneshot::Sender<Vec<SourceInfo>>,
-    updates_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
+    updates_tx: tokio::sync::mpsc::Sender<SourceUpdate>,
 ) -> ThumbnailStream {
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_for_thread = stop.clone();
-    let socket = Arc::new(Mutex::new(None));
-    let socket_for_thread = socket.clone();
+    let cancellation = Arc::new(ThumbnailCancellation::default());
+    let cancellation_for_thread = cancellation.clone();
     let join = std::thread::Builder::new()
         .name("portal-thumbnails".into())
         .spawn(move || {
-            let result = run_stream(
+            if let Err(e) = run_stream(
+                session_key,
+                request_id,
+                requested,
                 init_tx,
                 updates_tx,
-                stop_for_thread.clone(),
-                socket_for_thread.clone(),
-            );
-            // Do not keep a failed worker's connection alive via the cancellation handle.
-            socket_for_thread.lock().unwrap().take();
-            if let Err(e) = result
-                && !stop_for_thread.load(std::sync::atomic::Ordering::SeqCst)
+                &cancellation_for_thread,
+            ) && !cancellation_for_thread.is_stopped()
             {
                 tracing::warn!("thumbnail stream exited: {e}");
             }
         })
         .expect("spawn thumbnail thread");
     ThumbnailStream {
-        stop,
+        cancellation,
         join: Some(join),
-        socket,
     }
 }
 
 fn run_stream(
+    session_key: String,
+    request_id: SelectionRequestId,
+    requested: u32,
     init_tx: tokio::sync::oneshot::Sender<Vec<SourceInfo>>,
-    updates_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    socket: Arc<Mutex<Option<UnixStream>>>,
+    updates_tx: tokio::sync::mpsc::Sender<SourceUpdate>,
+    cancellation: &ThumbnailCancellation,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let conn = Connection::connect_to_env()?;
-    {
-        let mut socket = socket.lock().unwrap();
-        *socket = Some(UnixStream::from(conn.as_fd().try_clone_to_owned()?));
-        if stop.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(());
-        }
+    if cancellation.is_stopped() {
+        return Ok(());
     }
+    // connect_to_env itself is not interruptible until its socket is registered.
+    let conn = Connection::connect_to_env()?;
+    let Some(_registration) = cancellation.register(&conn)? else {
+        return Ok(());
+    };
     let display = conn.display();
     let mut event_queue: EventQueue<AppData> = conn.new_event_queue();
     let qh = event_queue.handle();
@@ -838,58 +948,72 @@ fn run_stream(
         event_queue.roundtrip(&mut app)?;
     }
 
-    // Snapshot the discovered proxies + identity strings up front. The
-    // refresh loop keys off the identity string ("source_id") so the picker
-    // can match incoming updates against its source list.
+    // Rebuild this list after dispatching events so open/close, title changes
+    // and output hotplug reach the picker while it is open.
     enum LiveSource {
         Output {
-            id: String,
             proxy: wl_output::WlOutput,
-            info: OutputInfo,
+            info: SourceInfo,
         },
         Toplevel {
-            id: String,
             proxy: ExtForeignToplevelHandleV1,
-            info: ToplevelInfo,
+            info: SourceInfo,
         },
     }
-    let live_sources: Vec<LiveSource> = {
+    impl LiveSource {
+        fn info(&self) -> &SourceInfo {
+            match self {
+                Self::Output { info, .. } | Self::Toplevel { info, .. } => info,
+            }
+        }
+    }
+    let discover = |thumbnails: &std::collections::HashMap<String, image::Handle>| {
         let s = state.lock().unwrap();
         let mut v: Vec<LiveSource> = Vec::new();
-        for o in &s.outputs {
-            v.push(LiveSource::Output {
-                id: o.info.name.clone(),
-                proxy: o.proxy.clone(),
-                info: o.info.clone(),
+        if requested & source_types::MONITOR != 0 {
+            let mut outputs: Vec<_> = s
+                .outputs
+                .iter()
+                .filter(|o| !o.info.name.is_empty() && o.info.width > 0 && o.info.height > 0)
+                .collect();
+            outputs.sort_by(|a, b| {
+                (a.info.position, &a.info.name).cmp(&(b.info.position, &b.info.name))
             });
+            for o in outputs {
+                v.push(LiveSource::Output {
+                    proxy: o.proxy.clone(),
+                    info: SourceInfo {
+                        kind: SourceKind::Output(o.info.clone()),
+                        thumbnail: thumbnails.get(&o.info.name).cloned(),
+                    },
+                });
+            }
         }
-        for t in &s.toplevels {
-            v.push(LiveSource::Toplevel {
-                id: t.info.identifier.clone(),
-                proxy: t.proxy.clone(),
-                info: t.info.clone(),
-            });
+        if requested & source_types::WINDOW != 0 {
+            for t in &s.toplevels {
+                if t.info.identifier.is_empty() {
+                    continue;
+                }
+                v.push(LiveSource::Toplevel {
+                    proxy: t.proxy.clone(),
+                    info: SourceInfo {
+                        kind: SourceKind::Toplevel(t.info.clone()),
+                        thumbnail: thumbnails.get(&t.info.identifier).cloned(),
+                    },
+                });
+            }
         }
         v
     };
 
-    // Send the source list immediately with thumbnails=None so the picker
-    // window opens without delay. Thumbnails flow in through `updates_tx`
-    // below, one source at a time — the picker fills them in as they arrive.
-    let initial: Vec<SourceInfo> = live_sources
+    let mut thumbnails = std::collections::HashMap::new();
+    let initial = discover(&thumbnails)
         .iter()
-        .map(|src| match src {
-            LiveSource::Output { info, .. } => SourceInfo {
-                kind: SourceKind::Output(info.clone()),
-                thumbnail: None,
-            },
-            LiveSource::Toplevel { info, .. } => SourceInfo {
-                kind: SourceKind::Toplevel(info.clone()),
-                thumbnail: None,
-            },
-        })
+        .map(|src| src.info().clone())
         .collect();
-    let _ = init_tx.send(initial);
+    if init_tx.send(initial).is_err() {
+        return Ok(());
+    }
 
     // Round-robin refresh. Short sleep between captures keeps CPU bounded
     // and avoids starving the compositor / cursor when many windows are
@@ -897,49 +1021,38 @@ fn run_stream(
     // — typical numbers: 1 source ~10fps, 5 sources ~2-3fps. Adjust if the
     // picker feels sluggish vs. too hot.
     let tick = std::time::Duration::from_millis(50);
-    let empty_idle = std::time::Duration::from_millis(200);
-    let mut live_sources = live_sources;
     let mut cursor = 0usize;
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        if live_sources.is_empty() {
-            std::thread::sleep(empty_idle);
-            continue;
+    while !cancellation.is_stopped() {
+        event_queue.roundtrip(&mut app)?;
+        let live_sources = discover(&thumbnails);
+        if !live_sources.is_empty() {
+            let src = &live_sources[cursor % live_sources.len()];
+            cursor = cursor.wrapping_add(1);
+            let handle = match src {
+                LiveSource::Output { proxy, .. } => {
+                    capture_output_thumbnail(&mut event_queue, &mut app, &qh, proxy)
+                }
+                LiveSource::Toplevel { proxy, .. } => {
+                    capture_toplevel_thumbnail(&mut event_queue, &mut app, &qh, proxy)
+                }
+            };
+            if let Some(handle) = handle {
+                thumbnails.insert(src.info().id().to_owned(), handle);
+            }
         }
-        let idx = cursor % live_sources.len();
-        cursor = cursor.wrapping_add(1);
-
-        // Skip dead proxies (window closed, output unplugged) — and prune
-        // them so we don't trip on them again. Touching a dead resource
-        // would cause the compositor to send us a protocol error, killing
-        // the whole stream.
-        let alive = match &live_sources[idx] {
-            LiveSource::Output { proxy, .. } => proxy.is_alive(),
-            LiveSource::Toplevel { proxy, .. } => proxy.is_alive(),
-        };
-        if !alive {
-            live_sources.remove(idx);
-            continue;
-        }
-
-        let (id, handle) = match &live_sources[idx] {
-            LiveSource::Output { id, proxy, .. } => (
-                id.clone(),
-                capture_output_thumbnail(&mut event_queue, &mut app, &qh, proxy),
-            ),
-            LiveSource::Toplevel { id, proxy, .. } => (
-                id.clone(),
-                capture_toplevel_thumbnail(&mut event_queue, &mut app, &qh, proxy),
-            ),
-        };
-        if let Some(handle) = handle
-            && updates_tx
-                .send(ThumbnailUpdate {
-                    source_id: id,
-                    handle,
-                })
-                .is_err()
-        {
-            break;
+        let sources: Vec<_> = discover(&thumbnails)
+            .iter()
+            .map(|src| src.info().clone())
+            .collect();
+        thumbnails.retain(|id, _| sources.iter().any(|src| src.id() == id));
+        match updates_tx.try_send(SourceUpdate {
+            session_key: session_key.clone(),
+            request_id,
+            sources,
+        }) {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            // Keep only a bounded number of snapshots if the UI is busy.
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
         }
         std::thread::sleep(tick);
     }
@@ -949,89 +1062,329 @@ fn run_stream(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
-    #[test]
-    fn protocol_guard_destroys_once_on_early_return() {
-        fn cleanup(counter: &Arc<AtomicUsize>) {
-            counter.fetch_add(1, Ordering::SeqCst);
+    const WATCHDOG: Duration = Duration::from_secs(2);
+
+    #[derive(Clone, Copy)]
+    struct FileIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    fn identity(fd: &impl AsFd) -> FileIdentity {
+        use std::os::fd::AsRawFd;
+        let metadata =
+            std::fs::metadata(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd())).unwrap();
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
         }
-        fn early_return(counter: Arc<AtomicUsize>) -> Option<()> {
-            let _guard = ProtocolGuard::new(counter, cleanup);
-            None?;
-            Some(())
+    }
+
+    // Check the underlying file, not just a raw fd number that another test may reuse.
+    fn open_fds(file: FileIdentity) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+            .filter(|metadata| metadata.dev() == file.device && metadata.ino() == file.inode)
+            .count()
+    }
+
+    fn has_mapping(file: FileIdentity) -> bool {
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .any(|line| {
+                line.split_whitespace()
+                    .nth(4)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    == Some(file.inode)
+                    && line.contains("memfd:shojiwm-portal-thumbnail")
+            })
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + WATCHDOG;
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        let counter = Arc::new(AtomicUsize::new(0));
-        assert_eq!(early_return(counter.clone()), None);
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    // If cancellation regresses, release the fake peer so this test fails instead
+    // of leaving the test runner stuck forever in ThumbnailStream::drop's join.
+    fn finish_drop(
+        dropper: std::thread::JoinHandle<()>,
+        done: mpsc::Receiver<()>,
+        peer: &UnixStream,
+    ) -> bool {
+        let timely = done.recv_timeout(WATCHDOG).is_ok();
+        let finished = timely || {
+            let _ = peer.shutdown(std::net::Shutdown::Both);
+            done.recv_timeout(WATCHDOG).is_ok()
+        };
+        if finished {
+            dropper.join().unwrap();
+        }
+        timely
     }
 
     #[test]
-    fn shm_layout_rejects_zero_and_overflow() {
-        assert_eq!(shm_layout(320, 180), Some((1280, 230400)));
-        for (w, h) in [
+    fn protocol_guards_destroy_once_on_success_and_each_early_error() {
+        type Resource = (&'static str, Arc<Mutex<Vec<&'static str>>>);
+        fn destroy(resource: &Resource) {
+            resource.1.lock().unwrap().push(resource.0);
+        }
+        fn capture_like(fail_after: usize, log: Arc<Mutex<Vec<&'static str>>>) -> Result<(), ()> {
+            let check = |step| if fail_after == step { Err(()) } else { Ok(()) };
+            let _source = ProtocolGuard::new(("source", log.clone()), destroy);
+            check(1)?;
+            let _session = ProtocolGuard::new(("session", log.clone()), destroy);
+            check(2)?;
+            let _pool = ProtocolGuard::new(("pool", log.clone()), destroy);
+            check(3)?;
+            let _buffer = ProtocolGuard::new(("buffer", log.clone()), destroy);
+            check(4)?;
+            let _frame = ProtocolGuard::new(("frame", log), destroy);
+            check(5)?;
+            Ok(())
+        }
+
+        let resources = ["source", "session", "pool", "buffer", "frame"];
+        for fail_after in 0..=resources.len() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            assert_eq!(
+                capture_like(fail_after, log.clone()).is_ok(),
+                fail_after == 0
+            );
+            let count = if fail_after == 0 {
+                resources.len()
+            } else {
+                fail_after
+            };
+            let expected: Vec<_> = resources[..count].iter().copied().rev().collect();
+            assert_eq!(*log.lock().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn shm_layout_checks_all_protocol_dimensions_and_pool_size() {
+        assert_eq!(
+            shm_layout(320, 180),
+            Some(ShmLayout {
+                width: 320,
+                height: 180,
+                stride: 1280,
+                size: 230400,
+            })
+        );
+        // Largest valid stride and largest valid height for a one-pixel row.
+        let limit = i32::MAX as u32 / 4;
+        assert_eq!(shm_layout(limit, 1).unwrap().size, limit as usize * 4);
+        assert_eq!(shm_layout(1, limit).unwrap().size, limit as usize * 4);
+        for (width, height) in [
             (0, 100),
             (100, 0),
             (u32::MAX, 1),
             (1, u32::MAX),
+            (limit + 1, 1),
+            (1, limit + 1),
+            (1, i32::MAX as u32 + 1),
             (1_000_000, 1_000_000),
         ] {
-            assert!(shm_layout(w, h).is_none());
+            assert!(
+                shm_layout(width, height).is_none(),
+                "accepted {width}x{height}"
+            );
         }
         assert!(ShmMapping::new(0).is_none());
         assert!(ShmMapping::new(i32::MAX as usize + 1).is_none());
     }
 
     #[test]
-    fn repeated_mapping_drop_releases_fd_and_mmap() {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
+    fn repeated_mapping_release_on_normal_and_early_error_paths() {
+        fn allocate_then_return(early_error: bool, file: &mut Option<FileIdentity>) -> Option<()> {
+            let mapping = ShmMapping::new(4096)?;
+            let identity = identity(&mapping.fd);
+            *file = Some(identity);
+            assert_eq!(open_fds(identity), 1);
+            assert!(has_mapping(identity));
+            if early_error {
+                None?;
+            }
+            Some(())
+        }
+
         for _ in 0..32 {
-            let mapping = ShmMapping::new(4096).unwrap();
-            let fd_path = format!("/proc/self/fd/{}", mapping.fd.as_raw_fd());
-            let inode = std::fs::metadata(&fd_path).unwrap().ino();
-            let has_mapping = || {
-                std::fs::read_to_string("/proc/self/maps")
-                    .unwrap()
-                    .lines()
-                    .any(|line| {
-                        line.split_whitespace()
-                            .nth(4)
-                            .and_then(|s| s.parse::<u64>().ok())
-                            == Some(inode)
-                            && line.contains("memfd:shojiwm-portal-thumbnail")
-                    })
-            };
-            assert!(has_mapping());
-            drop(mapping);
-            assert!(!has_mapping(), "thumbnail mapping survived its owner");
-            assert!(
-                std::fs::metadata(&fd_path)
-                    .map(|m| m.ino() != inode)
-                    .unwrap_or(true)
-            );
+            for early_error in [false, true] {
+                let mut file = None;
+                assert_eq!(
+                    allocate_then_return(early_error, &mut file).is_none(),
+                    early_error
+                );
+                let file = file.unwrap();
+                assert!(!has_mapping(file), "thumbnail mapping survived its owner");
+                assert_eq!(open_fds(file), 0, "thumbnail memfd survived its owner");
+            }
         }
     }
 
     #[test]
-    fn stream_drop_interrupts_blocked_reader_before_joining() {
-        use std::io::Read;
-        let (mut reader, _server) = UnixStream::pair().unwrap();
-        let socket = reader.try_clone().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let join = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let mut byte = [0];
-            assert_eq!(reader.read(&mut byte).unwrap(), 0);
+    fn socket_registration_clears_duplicate_on_early_error() {
+        fn fail_after_registration(
+            cancellation: &ThumbnailCancellation,
+            connection: &Connection,
+        ) -> Result<(), ()> {
+            let _registration = cancellation.register(connection).unwrap().unwrap();
+            assert!(cancellation.socket.lock().unwrap().is_some());
+            assert_eq!(open_fds(identity(connection)), 2);
+            Err(())?;
+            Ok(())
+        }
+
+        let (client, _peer) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let file = identity(&connection);
+        let cancellation = ThumbnailCancellation::default();
+        assert!(fail_after_registration(&cancellation, &connection).is_err());
+        assert!(cancellation.socket.lock().unwrap().is_none());
+        assert_eq!(open_fds(file), 1);
+        drop(connection);
+        assert_eq!(open_fds(file), 0);
+    }
+
+    #[test]
+    fn cancellation_before_socket_registration_does_not_keep_duplicate() {
+        let (client, _peer) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let file = identity(&connection);
+        let cancellation = Arc::new(ThumbnailCancellation::default());
+        drop(ThumbnailStream {
+            cancellation: cancellation.clone(),
+            join: None,
+        });
+        assert!(cancellation.register(&connection).unwrap().is_none());
+        assert!(cancellation.socket.lock().unwrap().is_none());
+        assert_eq!(open_fds(file), 1);
+        drop(connection);
+        assert_eq!(open_fds(file), 0);
+    }
+
+    #[test]
+    fn cancellation_during_socket_registration_does_not_miss_worker() {
+        let (client, peer) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let file = identity(&connection);
+        let cancellation = Arc::new(ThumbnailCancellation::default());
+        // Hold registration at its lock until the duplicate exists and Drop has
+        // set the stop flag. Either lock acquisition order must then be safe.
+        let registration_lock = cancellation.socket.lock().unwrap();
+        let worker_cancellation = cancellation.clone();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let registration = worker_cancellation.register(&connection).unwrap();
+            let registered = registration.is_some();
+            drop(registration);
+            registered_tx.send(registered).unwrap();
+        });
+        let duplicate_created = wait_until(|| open_fds(file) == 2);
+        let stream = ThumbnailStream {
+            cancellation: cancellation.clone(),
+            join: Some(worker),
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(stream);
+            done_tx.send(()).unwrap();
+        });
+        let cancel_started = wait_until(|| cancellation.is_stopped());
+        drop(registration_lock);
+        let timely = finish_drop(dropper, done_rx, &peer);
+        assert!(
+            duplicate_created,
+            "worker never reached socket registration"
+        );
+        assert!(cancel_started, "stream drop did not request cancellation");
+        assert!(timely, "stream drop did not finish within watchdog");
+        assert!(!registered_rx.recv_timeout(WATCHDOG).unwrap());
+        assert!(cancellation.socket.lock().unwrap().is_none());
+        assert_eq!(open_fds(file), 0);
+    }
+
+    #[test]
+    fn stream_drop_interrupts_real_wayland_roundtrip_before_joining() {
+        // A private socket pair acts as an unresponsive compositor. No process
+        // environment changes or connection to the user's compositor are needed.
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(WATCHDOG)).unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let file = identity(&connection);
+        let cancellation = Arc::new(ThumbnailCancellation::default());
+        let worker_cancellation = cancellation.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let failed = {
+                let _registration = worker_cancellation.register(&connection).unwrap().unwrap();
+                let mut queue: EventQueue<AppData> = connection.new_event_queue();
+                let mut app = AppData {
+                    state: Arc::new(Mutex::new(DiscoveryState::default())),
+                    capture: Arc::new(Mutex::new(CaptureState::default())),
+                };
+                queue.roundtrip(&mut app).is_err()
+            };
+            result_tx.send(failed).unwrap();
         });
         let stream = ThumbnailStream {
-            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            join: Some(join),
-            socket: Arc::new(Mutex::new(Some(socket))),
+            cancellation: cancellation.clone(),
+            join: Some(worker),
         };
-        let stop = stream.stop.clone();
-        started_rx.recv().unwrap();
-        drop(stream);
-        assert!(stop.load(Ordering::SeqCst));
+        // Read the actual wl_display.sync request and deliberately never reply.
+        let mut request = [0u8; 12];
+        let read_result = peer.read_exact(&mut request);
+        let pending = matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let (done_tx, done_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(stream);
+            done_tx.send(()).unwrap();
+        });
+        let timely = finish_drop(dropper, done_rx, &peer);
+        read_result.unwrap();
+        assert_eq!(u32::from_ne_bytes(request[..4].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_ne_bytes(request[4..8].try_into().unwrap()),
+            12 << 16
+        );
+        assert!(
+            pending,
+            "roundtrip returned without a sync reply or cancellation"
+        );
+        assert!(
+            timely,
+            "stream drop did not interrupt roundtrip within watchdog"
+        );
+        assert!(
+            result_rx.recv_timeout(WATCHDOG).unwrap(),
+            "shutdown should fail the pending roundtrip"
+        );
+        assert!(cancellation.is_stopped());
+        assert!(cancellation.socket.lock().unwrap().is_none());
+        assert_eq!(
+            open_fds(file),
+            0,
+            "worker connection or duplicate survived shutdown"
+        );
     }
 }

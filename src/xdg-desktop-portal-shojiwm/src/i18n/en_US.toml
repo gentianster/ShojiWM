@@ -12,7 +12,7 @@ no_windows = "No windows available."
 no_sources = "No capturable sources found."
 cancel = "Cancel"
 
-search = "Search by title or application"
+search = "Search by title, application or display name"
 preview_unavailable = "Preview unavailable"
 selected = "Selected"
 select = "Select this source"

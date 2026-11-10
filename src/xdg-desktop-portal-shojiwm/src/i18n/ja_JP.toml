@@ -11,7 +11,7 @@ no_windows = "利用可能なウィンドウがありません。"
 no_sources = "キャプチャ可能なソースが見つかりません。"
 cancel = "キャンセル"
 
-search = "タイトル・アプリ名で検索"
+search = "タイトル・アプリ名・画面名で検索"
 preview_unavailable = "プレビューを表示できません"
 selected = "選択中"
 select = "この対象を選択"

@@ -117,13 +117,13 @@ rustPlatform.buildRustPackage {
     lockFile = ../Cargo.lock;
 
     outputHashes = {
-      "smithay-0.7.0" = "sha256-l2IXXk5kaiUzXPc8JFCW7POxvHRDfiFNE1nq5OaT6QQ=";
-      "smithay-drm-extras-0.1.0" = "sha256-l2IXXk5kaiUzXPc8JFCW7POxvHRDfiFNE1nq5OaT6QQ=";
+      "smithay-0.7.0" = "sha256-rzHJ9oM1OAUSFIOwj2cEqx6AUgYxvT/Uz/BYifVKMDk=";
+      "smithay-drm-extras-0.1.0" = "sha256-rzHJ9oM1OAUSFIOwj2cEqx6AUgYxvT/Uz/BYifVKMDk=";
       "rustyscript-0.12.3" = "sha256-04yZws8aY6NpyQc0F6fg7CAwYYXer7r+eFABwafP+kU=";
       # The embedded xwayland-satellite and its workspace crates (one checkout).
-      "xwayland-satellite-0.8.2" = "sha256-844gZMJs14lbedTdXlaZR2E0uk5AoJHPA6Pzp3GSg6U=";
-      "macros-0.1.0" = "sha256-844gZMJs14lbedTdXlaZR2E0uk5AoJHPA6Pzp3GSg6U=";
-      "wl_drm-0.1.0" = "sha256-844gZMJs14lbedTdXlaZR2E0uk5AoJHPA6Pzp3GSg6U=";
+      "xwayland-satellite-0.8.3" = "sha256-IRO/5KV88Dn15Kx3dMNcJtJAmBWUA3i2uYqMo+UBCsE=";
+      "macros-0.1.0" = "sha256-IRO/5KV88Dn15Kx3dMNcJtJAmBWUA3i2uYqMo+UBCsE=";
+      "wl_drm-0.1.0" = "sha256-IRO/5KV88Dn15Kx3dMNcJtJAmBWUA3i2uYqMo+UBCsE=";
     };
   };
 

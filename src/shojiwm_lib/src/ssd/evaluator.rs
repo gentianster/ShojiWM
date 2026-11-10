@@ -4,10 +4,11 @@
 use super::window_model::{
     GestureSwipeEventSnapshot, ManagedWindowAnimationSnapshot, ManagedWindowState,
     PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandPopupSnapshot, WaylandWindowAction,
-    WaylandWindowSnapshot, WindowActivateRequestEventSnapshot, WindowDecorationDecisionSnapshot,
-    WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot,
-    WindowFullscreenRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
-    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    WaylandWindowSnapshot, WindowActivateRequestEventSnapshot, WindowDecorationClientSnapshot,
+    WindowDecorationDecisionSnapshot, WindowDecorationModeSnapshot,
+    WindowDecorationPolicyContextSnapshot, WindowFullscreenRequestEventSnapshot,
+    WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
+    WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
 use super::{
     DecorationBridgeError, DecorationLayoutError, DecorationNode, DecorationTree, EffectInput,
@@ -44,6 +45,15 @@ pub trait DecorationEvaluator {
         Ok(WindowDecorationDecisionSnapshot {
             mode: WindowDecorationModeSnapshot::Server,
         })
+    }
+
+    /// The legacy KDE decoration manager's default mode for `client`, or
+    /// `None` to leave it to the compositor (CSD).
+    fn kde_default_decoration_mode(
+        &self,
+        _client: &WindowDecorationClientSnapshot,
+    ) -> Result<Option<WindowDecorationModeSnapshot>, DecorationEvaluationError> {
+        Ok(None)
     }
 
     fn evaluate_cached_window(
@@ -350,6 +360,9 @@ pub struct RuntimeEventConfigUpdate {
     pub gesture_swipe: bool,
     #[serde(default)]
     pub gesture_swipe_async: bool,
+    /// Touchpad pinches (`RuntimeEvent::GesturePinch`).
+    #[serde(default)]
+    pub gesture_pinch_async: bool,
     /// Drag and drop events (`InputRequest::Dnd`).
     #[serde(default)]
     pub dnd: bool,

@@ -24,7 +24,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::server::{
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
 };
 
-use crate::{backend::tty::capture_live_snapshot_for_close, state::ShojiWM};
+use crate::{backend::capture_live_snapshot_for_close, state::ShojiWM};
 
 #[derive(Clone)]
 pub struct WlrForeignToplevelHandle {
@@ -979,10 +979,7 @@ impl ShojiWM {
         // it or anything the handler focuses instead.
         self.note_window_user_input(window);
         let previous = std::mem::replace(&mut self.user_input_in_flight, true);
-        self.request_window_activate(
-            window,
-            crate::ssd::WindowActivateRequestSourceSnapshot::Api,
-        );
+        self.request_window_activate(window, crate::ssd::WindowActivateRequestSourceSnapshot::Api);
         self.user_input_in_flight = previous;
     }
 

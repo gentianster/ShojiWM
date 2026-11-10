@@ -87,6 +87,22 @@ export type WindowDecorationResolver = (
   context: WindowDecorationContext,
 ) => WindowDecorationDecision;
 
+/**
+ * The process of a client that bound the legacy KDE decoration manager. It
+ * has no window yet, so there is no app id or title.
+ */
+export interface WindowDecorationClient {
+  readonly pid?: number;
+  /** `/proc/<pid>/exe`, e.g. `/usr/bin/thunar`, when readable. */
+  readonly executable?: string;
+  /** The command line, split into its arguments. */
+  readonly command: readonly string[];
+}
+
+export type KdeDefaultDecorationResolver = (
+  client: WindowDecorationClient,
+) => WindowDecorationMode;
+
 export interface CompositorWindowDecorationController {
   /**
    * Register the policy that selects CSD (`client`) or SSD (`server`). The
@@ -94,6 +110,20 @@ export interface CompositorWindowDecorationController {
    * changes and during config reload.
    */
   configure(resolver: WindowDecorationResolver): void;
+  /**
+   * Choose the default mode the legacy KDE decoration protocol announces to
+   * each client. GTK 3 applications (Thunar, ...) decide on their own title
+   * bar from this alone, once at startup, and ignore later per-window
+   * answers from `configure`; return `server` to have them leave the title
+   * bar to the compositor. Without a resolver the default is `client`.
+   *
+   * The resolver runs once per client, when it starts, so a change applies
+   * to applications started afterwards. Applications that draw their own
+   * title bar anyway (Firefox, GTK header bars) still ask for CSD, and
+   * `configure` should keep honoring that request: forcing `server` on
+   * them gives two title bars.
+   */
+  kdeDefaultMode(resolver: KdeDefaultDecorationResolver): void;
 }
 
 export type WaylandLayerKind = "background" | "bottom" | "top" | "overlay";
@@ -1658,6 +1688,20 @@ export interface WorkspaceActivateEvent {
 }
 
 /**
+ * A client (an ext-workspace bar) asked to create a workspace.
+ * クライアント（ext-workspace 対応バー）がワークスペースの作成を要求したイベント。
+ */
+export interface WorkspaceCreateEvent {
+  /** The group (`WorkspaceGroupConfig.id`) to create it in. / 作成先のグループ。 */
+  groupId?: string;
+  /**
+   * The name the client asked for; the config decides what to create.
+   * クライアントが指定した名前。何を作るかは設定側が決めます。
+   */
+  name: string;
+}
+
+/**
  * A client (KDE's Pager or taskbar) asked to move a window to a workspace.
  * クライアント（KDE の Pager やタスクバー）がウィンドウをワークスペースへ
  * 移動するよう要求したイベント。
@@ -1696,6 +1740,17 @@ export interface WorkspaceController {
      * 要求したときに呼ばれます（`virtualDesktops` 設定時のみ）。
      */
     onMoveWindow(listener: (event: WorkspaceMoveWindowEvent) => void): () => void;
+    /**
+     * Called when a client such as a bar asks to create a workspace
+     * (ext-workspace `create_workspace`). Bars are offered the request only
+     * while a listener is registered. Publish the new workspace from
+     * `configure` (and call `reconfigure`) so the client sees it.
+     * バーなどのクライアントがワークスペースの作成を要求したときに呼ばれます
+     * （ext-workspace の `create_workspace`）。リスナーがある間だけバーに
+     * この要求を許可します。新しいワークスペースは `configure` から公開し
+     * （`reconfigure` を呼び）、クライアントに見えるようにしてください。
+     */
+    onCreate(listener: (event: WorkspaceCreateEvent) => void): () => void;
   };
 }
 
@@ -1911,14 +1966,21 @@ export interface KeyBindingOptions {
 }
 
 /**
- * Registers compositor-level keyboard and discrete mouse-wheel shortcuts.
- * コンポジターレベルのキーボードおよびマウスホイールショートカットを登録します。
+ * Registers compositor-level keyboard, side-button and discrete mouse-wheel shortcuts.
+ * コンポジターレベルのキーボード、サイドボタンおよびマウスホイールショートカットを登録します。
  *
  * Shortcuts are identified by a string `id` (shown in help UIs). The `shortcut`
  * string uses modifier+key notation such as `"Super+T"`, `"Super+Shift+Left"`,
- * or `"Super+WheelScrollUp"`.
+ * `"Super+WheelScrollUp"` or `"Super+MouseForward"`.
+ * `MouseBack` and `MouseForward` use the standard Linux side-button codes.
+ * Side-button shortcuts only accept `on: "press"`; their release is consumed
+ * with the press, while unmatched buttons keep reaching applications.
  * ショートカットは文字列 `id` で識別されます（ヘルプ UI などに表示されます）。
- * `shortcut` は `"Super+T"` や `"Super+Shift+Left"` のような記法を使います。
+ * `shortcut` は `"Super+T"`、`"Super+Shift+Left"`、`"Super+WheelScrollUp"`、
+ * `"Super+MouseForward"` のような記法を使います。
+ * `MouseBack` と `MouseForward` は Linux 標準のサイドボタンのコードを使います。
+ * サイドボタンのショートカットは `on: "press"` のみ指定でき、リリースも押下と一緒に
+ * 消費されます。一致しなかったボタンはこれまでどおりアプリケーションに届きます。
  *
  * @example
  * ```ts
@@ -1932,7 +1994,7 @@ export interface KeyBindingOptions {
  */
 export interface KeyBindingController {
   /**
-   * Register a keyboard or mouse-wheel shortcut. `id` must be unique;
+   * Register a keyboard, side-button or mouse-wheel shortcut. `id` must be unique;
    * registering the same id twice replaces the previous binding.
    * ショートカットを登録します。`id` は一意である必要があります。
    * 同じ `id` を2回登録すると前のバインドが上書きされます。
@@ -3305,6 +3367,18 @@ export interface CompositorDefinition {
    * ```
    */
   pointer: PointerController;
+  /**
+   * Session-wide settings.
+   * セッション全体の設定。
+   *
+   * @example Start locked: the lock screen doubles as the login screen
+   * / ロックした状態で起動（ロック画面をログイン画面として使う）
+   * ```ts
+   * COMPOSITOR.session.startLocked = true;
+   * COMPOSITOR.process.once("locker", { command: ["hyprlock"] });
+   * ```
+   */
+  session: SessionController;
   runtime: RuntimeController;
   /**
    * Per-window scene-tree composition. Assign a function to control what chrome
@@ -3361,6 +3435,36 @@ export interface CompositorDefinition {
 
 export interface PreloadController {}
 
+export interface SessionController {
+  /** Select exact runtime roots behind a transparent lock; returns protocol lock state. */
+  configureLockBackground: typeof import("./session-lock").configureLockBackground;
+  /**
+   * Start with the session locked: only ext-session-lock surfaces (and any
+   * explicitly configured lock background roots) are drawn. Input reaches only
+   * the locker, until a locker (Quickshell's
+   * `WlSessionLock`, hyprlock, swaylock, ...) locks and then unlocks. The
+   * config has to start that locker itself. With automatic login this makes
+   * the lock screen the login screen. Default `false`.
+   *
+   * Read once, when the config first loads (set it at the top level of the
+   * config); a hot reload does not lock. A config that fails to load starts
+   * unlocked, since its locker would not start either. `Ctrl+Alt+F<n>` still
+   * switches VTs while locked, in case the locker never shows up.
+   *
+   * セッションをロックした状態で起動します。ロッカー（Quickshell の
+   * `WlSessionLock`、hyprlock、swaylock など）がロックして解除するまで、
+   * ext-session-lock のサーフェス以外は描画されず、入力もそこにしか届きません。
+   * ロッカーは設定側で起動してください。自動ログインと組み合わせると
+   * ロック画面がログイン画面になります。既定値は `false`。
+   *
+   * 設定の初回読み込み時に一度だけ読まれます（設定のトップレベルで指定して
+   * ください）。ホットリロードではロックしません。設定の読み込みに失敗した
+   * 場合はロッカーも起動しないため、ロックせずに起動します。ロッカーが現れない
+   * ときのため、ロック中も `Ctrl+Alt+F<n>` で VT を切り替えられます。
+   */
+  startLocked: boolean;
+}
+
 /**
  * Debug knobs. Toggles here are surfaced into compositor overlays / logs and
  * do not affect production behavior. Read-write properties take effect on the
@@ -3377,7 +3481,9 @@ export interface DebugController {
 
   /**
    * Enable or disable the built-in timescope profiler. Disabling after it was
-   * enabled dumps `summary.txt` and `report.html` under `~/shoji_wm/logs/`.
+   * enabled dumps `summary.txt` and `report.html` in the session log directory:
+   * `$XDG_STATE_HOME/shoji_wm/logs/`, defaulting to
+   * `~/.local/state/shoji_wm/logs/`, or `SHOJI_LOG_DIR` when set.
    */
   enableProfile(enabled: boolean): void;
 

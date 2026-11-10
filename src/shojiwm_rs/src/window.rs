@@ -84,7 +84,8 @@ impl WindowSignals {
         self.is_transient.set(snapshot.is_transient);
         self.parent_id.set(snapshot.parent_id.clone());
         self.plasma.set(snapshot.plasma.clone());
-        self.minimized_geometry.set(snapshot.minimized_geometry.map(Into::into));
+        self.minimized_geometry
+            .set(snapshot.minimized_geometry.map(Into::into));
         self.icon.set(snapshot.icon.clone());
         self.interaction.set(snapshot.interaction.clone());
         self.decoration.set(snapshot.decoration);
@@ -170,6 +171,28 @@ impl Window {
         match self.entry() {
             Some(entry) => entry.signals,
             None => dead_signals(),
+        }
+    }
+
+    /// Draw this window's decoration at `scale` times its authored size:
+    /// every length in its view (sizes, offsets, spacing, borders, radii,
+    /// shadows, fonts, popup offsets) is multiplied, so text stays sharp and
+    /// hit testing follows. A label without a font size or line height gets
+    /// the defaults' scaled values. Shader uniforms are not touched, nor is
+    /// the window's rect: a config that reserves room for its decoration
+    /// (a titlebar height in the managed rect) scales that itself. The
+    /// default is 1; a change rebuilds the whole view.
+    pub fn set_ui_scale(&self, scale: f64) {
+        let Some(entry) = self.entry() else {
+            return;
+        };
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        if entry.context.ui_scale.replace(scale) != scale {
+            entry.context.mark_full();
         }
     }
 

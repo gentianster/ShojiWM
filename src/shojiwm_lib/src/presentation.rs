@@ -570,6 +570,15 @@ impl ShojiWM {
     }
 
     fn window_frame_processing_applies_to_output(&self, window: &Window, output: &Output) -> bool {
+        if self.session_lock_active
+            && crate::backend::lock_scene::window_selected(window)
+            && self
+                .session_lock_surface_for_output(output)
+                .as_ref()
+                .is_some_and(crate::backend::lock_scene::locker_ready)
+        {
+            return self.space.outputs_for_element(window).contains(output);
+        }
         if self
             .composition_targets
             .get(&output.name())
@@ -1191,7 +1200,10 @@ impl ShojiWM {
             _ => None,
         };
         // The drag icon too: a client sizes it for the scale it is shown at.
-        for cursor_surface in cursor_surface.into_iter().chain(self.dnd.active_icon_surface()) {
+        for cursor_surface in cursor_surface
+            .into_iter()
+            .chain(self.dnd.active_icon_surface())
+        {
             with_surfaces_surface_tree(cursor_surface, |surface, states| {
                 let primary_scanout_output = surface_primary_scanout_output(surface, states);
                 if let Some(scanout) = primary_scanout_output.as_ref() {

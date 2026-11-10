@@ -221,8 +221,7 @@ impl XdgShellHandler for ShojiWM {
         // finalize handshake reports the close; if it did not, nobody else will.
         let mut promoted = false;
         if let Some(decoration) = decoration.as_ref() {
-            if let Err(error) = crate::backend::tty::capture_live_snapshot_for_close(self, &window)
-            {
+            if let Err(error) = crate::backend::capture_live_snapshot_for_close(self, &window) {
                 warn!(
                     window_id,
                     title = decoration.snapshot.title,
@@ -255,16 +254,22 @@ impl XdgShellHandler for ShojiWM {
         if !promoted
             && let Err(error) = self.close_window_in_runtime(
                 &window_id,
-                decoration.as_ref().map(|decoration| decoration.layout.root.rect),
+                decoration
+                    .as_ref()
+                    .map(|decoration| decoration.layout.root.rect),
             )
         {
-            warn!(window_id, ?error, "failed to report destroyed xdg toplevel to the runtime");
+            warn!(
+                window_id,
+                ?error,
+                "failed to report destroyed xdg toplevel to the runtime"
+            );
         }
         // Elect a successor now that the window is out of the space. Nothing
         // else on the close path touches keyboard focus, so the dead target
         // used to survive until some unrelated event ran
         // `update_keyboard_focus` — and no replacement was ever chosen.
-        self.update_keyboard_focus(smithay::utils::SERIAL_COUNTER.next_serial());
+        self.update_keyboard_focus_after_destroy(wl_surface);
         self.remove_window_decoration_negotiation(wl_surface);
         self.request_tty_maintenance("xdg-toplevel-destroyed");
         self.schedule_redraw();
@@ -602,9 +607,7 @@ impl XdgShellHandler for ShojiWM {
             return;
         }
 
-        if can_receive_keyboard_focus
-            && let Some(keyboard) = keyboard.as_ref()
-        {
+        if can_receive_keyboard_focus && let Some(keyboard) = keyboard.as_ref() {
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         if let Some(pointer) = pointer.as_ref() {
@@ -850,7 +853,10 @@ impl ShojiWM {
         let Some((output_geo, layer_geo)) = self.space.outputs().find_map(|output| {
             let map = layer_map_for_output(output);
             let layer = map.layer_for_surface(root, WindowSurfaceType::TOPLEVEL)?;
-            Some((self.space.output_geometry(output)?, map.layer_geometry(layer)?))
+            Some((
+                self.space.output_geometry(output)?,
+                map.layer_geometry(layer)?,
+            ))
         }) else {
             return;
         };

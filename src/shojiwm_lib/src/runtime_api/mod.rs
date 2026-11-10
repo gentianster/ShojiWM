@@ -24,7 +24,8 @@ use std::{collections::BTreeMap, ffi::OsStr, path::PathBuf};
 pub use handle::RuntimeHandle;
 pub use host::{HostMessage, RuntimeConfigDelta, RuntimeHost, RuntimeSchedule};
 pub use message::{
-    CompositionPatch, DecorationRequest, OVERLAY_STAGE_INDEX, PAINT_STAGE_INDEX, SHADER_INPUT_STAGE_INDEX, EffectRequest, InputRequest, RuntimeEvent, RuntimeReply, RuntimeRequest,
+    CompositionPatch, DecorationRequest, EffectRequest, InputRequest, OVERLAY_STAGE_INDEX,
+    PAINT_STAGE_INDEX, RuntimeEvent, RuntimeReply, RuntimeRequest, SHADER_INPUT_STAGE_INDEX,
     SchedulerTickRequest, WindowRequest, WorkspaceRequest,
 };
 
@@ -119,6 +120,14 @@ pub trait RuntimeLauncher {
     /// Construct the runtime. Must not block on loading the config; that
     /// happens in [`ConfigRuntime::preload`].
     fn launch(&self, context: LaunchContext) -> Box<dyn ConfigRuntime>;
+
+    /// Whether the session starts locked: nothing but session-lock surfaces
+    /// is drawn, and input reaches only them, until a locker
+    /// (ext-session-lock) locks and then unlocks. With automatic login this
+    /// makes the lock screen the login screen.
+    fn start_locked(&self) -> bool {
+        false
+    }
 }
 
 /// Everything a launcher gets to build its runtime from.
@@ -181,8 +190,17 @@ impl RuntimeBoot {
         self.launch_with_display(host, None)
     }
 
+    /// See [`RuntimeLauncher::start_locked`].
+    pub fn start_locked(&self) -> bool {
+        self.launcher.start_locked()
+    }
+
     /// [`launch`](Self::launch) for a compositor listening on `wayland_display`.
-    pub fn launch_with_display(&self, host: RuntimeHost, wayland_display: Option<&OsStr>) -> RuntimeHandle {
+    pub fn launch_with_display(
+        &self,
+        host: RuntimeHost,
+        wayland_display: Option<&OsStr>,
+    ) -> RuntimeHandle {
         let context = LaunchContext {
             config_path: self
                 .config_path

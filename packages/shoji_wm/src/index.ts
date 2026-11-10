@@ -1,4 +1,6 @@
 /// <reference path="./runtime-globals.d.ts" />
+export { configureLockBackground, installSessionLockBridge } from "./session-lock";
+export type { LockBackgroundSelection } from "./session-lock";
 import type {
   CompositionRenderable,
   AppIconProps,
@@ -78,6 +80,8 @@ import type {
   WorkspaceConfigEntry,
   WorkspaceConfigureFactory,
   WorkspaceController,
+  WorkspaceCreateEvent,
+  WorkspaceMoveWindowEvent,
   WorkspaceGroupConfig,
   EnvController,
   EnvUpdateOperation,
@@ -211,6 +215,7 @@ import { INPUT_CONTROLLER, installInputDeviceChangeEmitter } from "./input";
 import { OUTPUT_CONTROLLER, installOutputChangeEmitter } from "./output";
 import { WORKSPACE_CONTROLLER } from "./workspace";
 import { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
+import { SESSION_CONTROLLER } from "./session";
 import { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
 import { CURSOR_CONTROLLER, takePendingCursorConfig } from "./cursor";
 import { DND_CONTROLLER } from "./dnd";
@@ -430,13 +435,16 @@ export {
   commitWorkspaceConfigurationRegistration,
   emitWorkspaceActivate,
   takePendingWorkspaceConfig,
+  type WorkspaceConfigPayload,
 } from "./workspace";
 export { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 export {
   WINDOW_DECORATION_CONTROLLER,
+  resolveKdeDefaultDecorationMode,
   resolveWindowDecorationDecision,
 } from "./window-decoration";
 export { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
+export { SESSION_CONTROLLER, sessionStartLocked } from "./session";
 export { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
 export {
   CURSOR_CONTROLLER,
@@ -730,6 +738,8 @@ export type {
   SurfacePolicyTarget,
   CompositorWindowController,
   CompositorWindowDecorationController,
+  KdeDefaultDecorationResolver,
+  WindowDecorationClient,
   WindowDecorationContext,
   WindowDecorationDecision,
   WindowDecorationMode,
@@ -1167,6 +1177,7 @@ function createCompositorDefinition(): CompositorDefinition {
     process: PROCESS_CONTROLLER,
     key: KEY_BINDING_CONTROLLER,
     pointer: POINTER_CONTROLLER,
+    session: SESSION_CONTROLLER,
     input: INPUT_CONTROLLER,
     cursor: CURSOR_CONTROLLER,
     dnd: DND_CONTROLLER,
