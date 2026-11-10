@@ -1,24 +1,23 @@
 # ShojiWM upstream integration candidate
 
-**Deployment update, 2026-11-10 21:02 JST:** The user subsequently authorized the full update and chose atomic replacement before logout. The matching compositor, portal, SDK and decoration runtime are now installed and hash-verified. Existing processes were left running the old executables; fresh-login activation and live checks are pending. See `DESKTOP-BUILD.md` for exact installed hashes and fresh rollback records. The no-install statements below describe the earlier preparation phase. No push or main/PR merge has occurred.
+**Current status, 2026-11-10 (JST):** The tested integration stack was installed at 21:02. After the user's logout/reboot, running compositor and portal hashes matched the installed candidate. PR #7 was separately merged into fork main at `22e2833612e402fb9e01612c313cd7da6cfe0e84` at 21:42. This branch now includes that main commit without changing the tested code. This publication step does not install or restart anything. See `DESKTOP-BUILD.md` for exact build provenance, installed hashes and rollback records.
 
-Date: 2026-11-10 (JST). Branch: `integration/upstream-20261110`.
+Branch: `integration/upstream-20261110`.
 
 ## Scope and checkpoints
 
-- Fork base: `e6d5b187f137e5a256a6d4ce984faedbe22d8f71` (`origin/main`).
-- Upstream baseline: `2ae3e7c9a412c4656a3908fedc46637d8ec79c79` ([source](https://github.com/bea4dev/ShojiWM/commit/2ae3e7c9a412c4656a3908fedc46637d8ec79c79)).
-- Common ancestor: `98f84845ebbaabf0cd847d7dc5ac628e5adfccce`.
-- Stage 1: merge `52615c3277d2faca82f9313432d4e22e77507bcd`, upstream plus fork-specific changes. Its tree is identical to the originally verified snapshot `e71fc2753dca014b8cfc483afd46b3a31e8c4fc5`.
-- Stage 2: `030c7f9246b0fb9e4238ca1a0c74baff337facb1`, with the exact tree previously verified at `167693183a041edcf94becebeb8c4d7d515977b0`. The following portal changes adapt [PR #7](https://github.com/gentianster/ShojiWM/pull/7), implementation `8ca5abe9672e66edf313d432ed03407bea470c6e`, to that verified baseline.
-- Stage 1 is now a proper two-parent **local integration-branch merge**, with fork `e6d5b18` as first parent and upstream `2ae3e7c` as second parent. Both are confirmed ancestors. Main and PR refs remain unchanged.
-- No push, PR update, merge into main, installed-file replacement, portal restart or desktop restart was performed for this candidate.
-
-The original PR branch, including its local deployment record, remains at `e452e6e0bb382c1fd28de1f936f8fc88c1bfc4cc`. `DESKTOP-BUILD.md` retains that record and describes the previously installed PR #7 build, not this candidate.
+- Original fork base: `e6d5b187f137e5a256a6d4ce984faedbe22d8f71`.
+- Current PR base: fork main `22e2833612e402fb9e01612c313cd7da6cfe0e84`, including the original [PR #7](https://github.com/gentianster/ShojiWM/pull/7).
+- Pinned upstream baseline: `2ae3e7c9a412c4656a3908fedc46637d8ec79c79` ([source](https://github.com/bea4dev/ShojiWM/commit/2ae3e7c9a412c4656a3908fedc46637d8ec79c79)). This is the tested and deployed baseline, **not latest upstream**. At publication preparation, upstream main was `1259ac0b9a23f485845e8f820129b4612d6befaa`, with four later commits (default-theme changes, scaled-window shadow handling and formatting). Those are deliberately excluded from this PR.
+- Original common ancestor: `98f84845ebbaabf0cd847d7dc5ac628e5adfccce`.
+- Stage 1: two-parent merge `52615c3277d2faca82f9313432d4e22e77507bcd`, fork `e6d5b18` plus upstream `2ae3e7c`. Its tree is identical to originally verified snapshot `e71fc2753dca014b8cfc483afd46b3a31e8c4fc5`.
+- Stage 2: `030c7f9246b0fb9e4238ca1a0c74baff337facb1`, the exact tree previously verified at `167693183a041edcf94becebeb8c4d7d515977b0`. It adapts PR #7 implementation `8ca5abe9672e66edf313d432ed03407bea470c6e` to the upstream lifecycle and dynamic-source model.
+- Main reconciliation: merge `8c8d3da8e94d6a3a874e5cb8909c1fa3fd2121bf` has parents `4315188` and `22e2833`. Main added only original PR #7; the five overlapping portal files were already adapted in stage 2. The **entire** merge tree equals `4315188` (`5d129732e1ba4db31c88d7461ab40e63069f6f6a`), not just the conflict files. Both current main and the pinned upstream commit are ancestors.
+- The original PR branch and local deployment record remain at `e452e6e0bb382c1fd28de1f936f8fc88c1bfc4cc`; no extra worktree was created. The integration PR remains a separate review and merge decision.
 
 ## Stage 1: conflict resolutions
 
-The fork has 16 unique commits and upstream has 71 since the common ancestor. Five files each had one textual conflict:
+At the original stage-one fork/upstream baselines, the fork had 16 unique commits and upstream had 71 since the common ancestor. Five files each had one textual conflict:
 
 | File | Resolution |
 | --- | --- |
@@ -64,7 +63,7 @@ The stage-one portal picker, source discovery and screencast files were byte-for
 
 ## Regression checklist and actual results
 
-This checklist was recorded before source changes and then updated from completed commands. No retry-until-green was used.
+This checklist was recorded before source changes and then updated from completed commands. These are the historical stage-one/stage-two checks; the publication rerun is recorded separately below. No retry-until-green was used. Temporary logs from the earlier phase were lost during the subsequent OS reboot, so they are not claimed to remain available.
 
 | Area | Result and boundary |
 | --- | --- |
@@ -83,7 +82,22 @@ This checklist was recorded before source changes and then updated from complete
 | Documentation | Typecheck and English/Japanese production builds passed; docs locks unchanged. |
 | Nix | Not verified: evaluation with invocation-only `nix-command flakes` reached the daemon but failed with Permission denied on `/nix/var/nix/daemon-socket/socket`. No permissions, config, services or lockfiles were changed. |
 | Visual picker QA | Japanese synthetic windows at widths 720 and 360 rendered successfully. Selected, empty and no-match states inspected; footer actions remain visible, long titles wrap, Share is disabled without valid selection. Only each demo's own renderer was saved, never desktop/source content. |
-| Live sharing/hardware | Candidate not installed. Actual Chrome shared frames, hardware mixed-DPI behavior, fresh-session NumLock and PAM lock/unlock require separately authorized live validation. |
+| Live sharing/hardware | Matching stack is installed and running hashes are verified. Actual Chrome shared frames, hardware mixed-DPI behavior, fresh-session NumLock and PAM lock/unlock remain unverified for this candidate. |
+
+## Publication verification after PR #7 merge
+
+Fresh checks on the code-identical `8c8d3da` tree passed on 2026-11-10. The final documentation update changes only this report and `DESKTOP-BUILD.md`.
+
+- Locked workspace build and all-target test compilation: passed.
+- All 13 compiled test harnesses ran in private IPC/config/state/cache namespaces, without connecting to the live desktop: **489 distinct tests passed**, plus 28 duplicated picker/demo cases. Four normally ignored GPU tests passed separately using surfaceless software EGL. No failures or retries.
+- Portal subset: 35 cases passed, including picker, request lifecycle and resource cleanup.
+- Full-workspace formatting and whitespace checks: passed. Strict Clippy for the portal binary and picker demo: passed.
+- SDK TypeScript check, eight overlay cases plus fixtures, and four output-power cases: passed.
+- Documentation TypeScript check and English/Japanese production builds: passed.
+- Read-only code review found no materially lost PR #7 feature or new blocking regression. Both current main `22e2833` and pinned upstream `2ae3e7c` are ancestors; the main-reconciliation merge preserved the full prior candidate tree.
+- Prior exact-pin satellite tests, configuration checks, synthetic GUI inspection and optimized release build were not rerun because their source and dependencies are unchanged. Their historical results and limits are listed above. Nix evaluation remains unverified after the earlier daemon-access denial; it was not retried through another route.
+
+Fresh logs and exit codes are under `target/integration-verification-20261110/`, including `native-compile.*`, `native-results.json`, individual harness logs, `offscreen-egl.log`, `workspace-build.log`, `format.log`, `portal-clippy.log` and `web/`. These are local development artifacts, not an external download link. Remote CI status must be checked for the published head rather than inferred from these local results.
 
 ## Review, remaining edges and next decision
 
@@ -91,7 +105,7 @@ Final read-only review found no confirmed new blocking regression in the stage-t
 
 The thumbnail worker can interrupt an established Wayland connection. The initial `Connection::connect_to_env()` call occurs before socket registration and is not made interruptible by this patch. Thus a pathological stall during initial connection setup is not covered by the blocked-roundtrip test. Aborting the outer `SelectSources` future also drops its joining guard inline instead of reaching normal `spawn_blocking` teardown; this pre-existing path can still block during that setup edge. Tests cover picker-future abort and thumbnail interruption separately, not an end-to-end outer-future abort. Cancellation during actual asynchronous window opening has state-level coverage only, not a real UI event-order test.
 
-The local integration history now records upstream ancestry correctly. Publishing this branch, merging it into main and installing it still require explicit decisions. Live validation should explicitly cover repeated picker open/cancel/share/stop, successful browser frame delivery, stable thumbnail FD/mapping counts after cancellation, NumLock, lock/unlock, and hardware mixed-DPI/XWayland popup positions. Preserve the existing installed-binary rollback plan.
+The local integration history records both pinned upstream and merged PR #7 ancestry. The user requested continuation to publish the integration for review. Merging this integration into main and any further deployment remain separate decisions. Live validation should explicitly cover repeated picker open/cancel/share/stop, successful browser frame delivery, stable thumbnail FD/mapping counts after cancellation, NumLock, lock/unlock, and hardware mixed-DPI/XWayland popup positions. Preserve the existing installed-binary rollback plan.
 
 ## Local history repair after review
 
@@ -103,55 +117,44 @@ Muse reviewed the original candidate read-only and reported no blocking findings
 | Portal port | `1676931` | `030c7f9` |
 | Original report and deployment provenance | `6f557fe` | `15bc7ae` |
 
-Each pair has an identical Git tree. The full tree shared by `6f557fe` and `15bc7ae` is `e0e987b94bc810341ab240c4df26f2347f3f64ae`. The original candidate remains reachable through local tag `integration/upstream-20261110-reviewed-snapshot`. The only subsequent content changes are updates to this report.
+Each pair has an identical Git tree. The full tree shared by `6f557fe` and `15bc7ae` is `e0e987b94bc810341ab240c4df26f2347f3f64ae`. The original candidate remains reachable through local tag `integration/upstream-20261110-reviewed-snapshot`. Subsequent content changes before main reconciliation are deployment and verification updates in this report and `DESKTOP-BUILD.md`; source code is unchanged.
 
-After reconstruction, the locked workspace build, all-target native harnesses (489 distinct cases, plus 28 duplicated demo cases), four offscreen EGL cases and formatting checks passed again. Evidence is in `ancestry-*.log`, `ancestry-native-results.json` and `ancestry-repair.json` in the local evidence directory. No new checkout, main/PR update, remote publication or live installation was made.
+After reconstruction, the locked workspace build, all-target native harnesses (489 distinct cases, plus 28 duplicated demo cases), four offscreen EGL cases and formatting checks passed again. Those earlier logs were temporary and did not survive the later OS reboot. No new checkout, main/PR update, remote publication or live installation was made during that reconstruction phase.
 
-## Live-validation preparation and approval boundary
+## Current deployment and live-verification boundaries
 
-Read-only host inspection confirmed the running compositor PID 8371 and portal PID 769844 still have the installed hashes below. Session target, portal frontend, GTK backend, ShojiWM backend and FD watcher were active at inspection. Recheck all state immediately before any eventual deployment.
+The user approved the full stack update and chose atomic replacement before their own logout/login. Both executables and the matching SDK/runtime were installed at 21:02 JST with verified backups. After logout/reboot, the actual compositor and portal executables matched the candidate hashes below. Runtime files and metadata also match the staged manifest. No configuration files or SDK symlinks were changed. Publication preparation performs no further installation, service restart, config reload, logout or lock test.
 
-The current config repository and actual runtime configuration are not identical: `~/.config/shojiwm/index.tsx` and `window-manager.ts` differ, and live-only drag/drop, workspace-drum and shader files exist. Both baseline and candidate static checks of the actual live tree now pass; no user config file or SDK link was changed. TypeScript 5.9.3 checked all 10 live TS/TSX roots; the candidate resolution included 36 candidate SDK files and zero installed SDK files. Logs and command details are in `live-config-check/REPORT.md` under the evidence directory.
+The user reported non-responsive mouse movement/buttons after the update, persisting through their reboot, then reported recovery during read-only diagnosis. No input settings, device resets, injected events, reloads or rollback were performed during that diagnosis. The cause and recovery mechanism are **not established**, and this is not claimed as a code fix. Both new executables remained active when recovery was reported.
 
-A behavioral caveat remains: live `index.tsx` forces server decorations and does not set the newly available `kdeDefaultMode` hook. Candidate documentation warns that GTK3/KDE-default clients or clients drawing their own titlebars can behave differently, including possible double titlebars. Typechecking cannot validate this. Include GTK/KDE/client-decorated application titlebars and the live-only drag/workspace/fullscreen interactions in later visual checks; no config behavior was silently changed here.
+The configuration repository and actual runtime configuration are not identical. The live tree is `~/.config/shojiwm/src/`; its `index.tsx` and `window-manager.ts` differ from the configuration repository, and live-only drag/drop, workspace-drum and shader files exist. Earlier baseline and candidate static checks of all 10 live TS/TSX roots passed with TypeScript 5.9.3; candidate resolution included 36 candidate SDK files and zero installed SDK files. No config or SDK-link changes were made. Those temporary logs were lost on reboot, and this publication step does not repeat live-config checks because the code and SDK are unchanged.
 
-The compositor must be deployed and rolled back with these matching components:
+A behavioral caveat remains: live `index.tsx` forces server decorations and does not set the new `kdeDefaultMode` hook. GTK3/KDE-default clients or clients drawing their own titlebars may behave differently, including possible double titlebars. Typechecking does not verify this. Later authorized visual checks should include those titlebars, live-only drag/workspace/fullscreen interactions, successful browser frame delivery, repeated picker open/cancel/share/stop, stable FD/mapping counts, NumLock, lock/unlock and hardware mixed-DPI/XWayland popup positions.
 
-- `/usr/bin/shoji_wm`
-- `/usr/lib/shojiwm/packages/shoji_wm/`
-- `/usr/lib/shojiwm/tools/decoration-runtime.ts`
+The compositor and SDK/runtime must be deployed or rolled back as a matching set: `/usr/bin/shoji_wm`, `/usr/lib/shojiwm/packages/shoji_wm/` and `/usr/lib/shojiwm/tools/decoration-runtime.ts`. The embedded satellite is part of the compositor build. The portal binary can be changed separately only with its own compatibility and idle-sharing checks. Service definitions, D-Bus activation and the portal descriptor did not need changes.
 
-Installed SDK/runtime match the old compositor source. Do not hot-reload the candidate runtime into that old compositor. The embedded satellite is part of the compositor build and needs no separate executable install. Preserve user configuration and its existing SDK symlink.
+The complete old stack is backed up under `/usr/local/lib/shojiwm-backups/upstream-20261110-13ed0a9/old/`. Preserve this rollback set and the user configuration. Do not blindly invoke install scripts: they can replace the runtime or restart more services than intended. A future publication or merge does not authorize a new installation or session interruption.
 
-The portal binary is independently replaceable. Its installed service, D-Bus activation file and portal descriptor already match the candidate, so those definitions need no changes. With explicit authorization and no active sharing, a staged atomic binary replacement and restart of only `xdg-desktop-portal-shojiwm.service` can validate the new portal on the old compositor. This would not establish full new-compositor compatibility.
-
-For the full compositor upgrade, agree on a user-controlled logout/login window and install the matching binary/SDK/runtime set while the old session is stopped. Then verify actual running hashes, repeated screen-sharing cancellation and successful frames from a synthetic window, stable FD/mapping counts, NumLock, lock/unlock and mixed-DPI/XWayland popup positions.
-
-Before replacing anything, make fresh verified backups of the current compositor, portal and entire `/usr/lib/shojiwm`. Existing historical binary backups are older than the current installation and are not sufficient rollback points for this upgrade. The portal can be rolled back independently with an idle-backend restart; compositor and SDK/runtime must be restored together for a fresh session.
-
-Do not invoke `dist/install.sh`, `install-portal.sh`, or an install `--no-build` shortcut blindly. They can overwrite installed files, remove the runtime directory and/or restart the portal frontend more broadly than this staged plan. At preparation start the release portal was still the old installed binary and no release compositor existed in this checkout; newly built release hashes must be verified before any installation.
-
-This report does not authorize publication, main merge, installation, session interruption, screen-sharing tests or locking the desktop. Those remain explicit next decisions. Local release preparation and static checks do not change the running session.
-
-## Prepared release artifacts (not installed)
+## Release artifacts and deployment provenance
 
 Locked optimized build completed successfully in 5m57s on 2026-11-10 at 19:36 JST:
 
 `nice -n 10 cargo build --locked --release -p shoji_wm -p xdg-desktop-portal-shojiwm -j 4`
 
-The build used source commit `15bc7ae0f07d2ff03ee6a6fa9169fce977391e22`, identical to the reviewed candidate; later edits only update this report. Both files were verified as x86-64 ELF executables. Neither was launched or installed.
+The build used source commit `15bc7ae0f07d2ff03ee6a6fa9169fce977391e22`, with the exact tree of reviewed candidate `6f557fe`. Later checkpoint `13ed0a9` was recorded in the deployment manifest and differs only in documentation. Both files were verified as x86-64 ELF executables, installed at 21:02 JST, and activated by the user's subsequent session restart. Main reconciliation and publication documentation do not alter their source code.
 
 | Artifact | SHA-256 |
 | --- | --- |
 | `target/release/shoji_wm` | `db54115c4d4d1ee34dbfc94c904a378dda20bc1062dc25f883ba344ec5efdf76` |
 | `target/release/xdg-desktop-portal-shojiwm` | `b948936d8e8e89bd8d4181f070f7142bcb9c39cc4280e052fa193fb880a375dd` |
 
-Logs: `ancestry-release-build.log`, exit marker `0`, and `ancestry-release-hashes.txt` in the evidence directory. Installed binary hashes and protected main/PR refs were rechecked after the build and remain unchanged. Recheck artifact hashes immediately before any later installation because normal Cargo builds can replace target files.
+The original temporary release-build logs were lost on reboot. Durable root-owned deployment evidence remains in `result.json`, `manifest.json` and `apply-now.log` under `/usr/local/lib/shojiwm-backups/upstream-20261110-13ed0a9/`; candidate and old-stack copies are retained there. Installed and running hashes were verified after the user restarted the session and again after the PR #7 merge. Recheck artifacts before any later installation because normal Cargo builds can replace target files.
 
 ## Reproduction and evidence
 
 - Native compile: `cargo test --locked --workspace --all-targets --no-run --message-format=json -j 4`.
 - Compiled harnesses were run one at a time through `tests/run-native-tests.py`, with private runtime/config/state/cache paths and no desktop DBus/Wayland connection. Software EGL opt-in tests used the same isolation.
 - Satellite: `cargo test --offline --locked --lib -j 2 -- --test-threads 1`; compile integration harness, then run each of its 45 listed cases in a fresh private runtime and process group.
-- Detailed logs, runner scripts, the original pre-edit checklist and synthetic screenshots are retained locally under `/tmp/shoji-upstream-integration-20261110/`. This is temporary local evidence, not an external share link.
-- Installed portal remains SHA-256 `e41956bdf07c3dc687e5d4adaaeafec42e7c7b3df1e6ca95f0029f638916cb69`; installed compositor remains `6cbe48afa897195037ccbbd1fbf6da6e385854d26d11e123b527fda2e5803f10`.
+- Earlier logs and synthetic screenshots under `/tmp/shoji-upstream-integration-20261110/` did not survive the reboot. They are historical results, not downloadable artifacts.
+- Fresh publication verification logs are saved under the ignored, non-temporary `target/integration-verification-20261110/` in this checkout. Build outputs remain regenerable and are not source backups.
+- Current installed and running hashes are the release-artifact hashes above; the previous hashes and full rollback set are recorded in `DESKTOP-BUILD.md`.
