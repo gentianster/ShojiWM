@@ -11,6 +11,14 @@ no_windows = "利用可能なウィンドウがありません。"
 no_sources = "キャプチャ可能なソースが見つかりません。"
 cancel = "キャンセル"
 
+search = "タイトル・アプリ名で検索"
+preview_unavailable = "プレビューを表示できません"
+selected = "選択中"
+select = "この対象を選択"
+share = "共有する"
+instructions = "対象を選んで「共有する」を押してください。Esc でキャンセルできます。"
+no_matches = "検索に一致する対象がありません。タイトルやアプリ名を変えてください。"
+
 [source]
 window = "ウィンドウ"
 window_with_id = "ウィンドウ — {id}"

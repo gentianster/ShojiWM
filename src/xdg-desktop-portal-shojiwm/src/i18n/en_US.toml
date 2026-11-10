@@ -12,6 +12,14 @@ no_windows = "No windows available."
 no_sources = "No capturable sources found."
 cancel = "Cancel"
 
+search = "Search by title or application"
+preview_unavailable = "Preview unavailable"
+selected = "Selected"
+select = "Select this source"
+share = "Share"
+instructions = "Select a source, then choose Share. Esc cancels."
+no_matches = "No sources match your search. Try another title or application."
+
 [source]
 window = "Window"
 window_with_id = "Window — {id}"
