@@ -86,7 +86,7 @@ This checklist was recorded before source changes and then updated from complete
 
 ## Publication verification after PR #7 merge
 
-Fresh checks on the code-identical `8c8d3da` tree passed on 2026-11-10. The final documentation update changes only this report and `DESKTOP-BUILD.md`.
+Fresh checks on the code-identical `8c8d3da` tree passed on 2026-11-10. The initial publication documentation update changes only this report and `DESKTOP-BUILD.md`. The subsequent Nix-only CI correction is recorded below.
 
 - Locked workspace build and all-target test compilation: passed.
 - All 13 compiled test harnesses ran in private IPC/config/state/cache namespaces, without connecting to the live desktop: **489 distinct tests passed**, plus 28 duplicated picker/demo cases. Four normally ignored GPU tests passed separately using surfaceless software EGL. No failures or retries.
@@ -98,6 +98,14 @@ Fresh checks on the code-identical `8c8d3da` tree passed on 2026-11-10. The fina
 - Prior exact-pin satellite tests, configuration checks, synthetic GUI inspection and optimized release build were not rerun because their source and dependencies are unchanged. Their historical results and limits are listed above. Nix evaluation remains unverified after the earlier daemon-access denial; it was not retried through another route.
 
 Fresh logs and exit codes are under `target/integration-verification-20261110/`, including `native-compile.*`, `native-results.json`, individual harness logs, `offscreen-egl.log`, `workspace-build.log`, `format.log`, `portal-clippy.log` and `web/`. These are local development artifacts, not an external download link. Remote CI status must be checked for the published head rather than inferred from these local results.
+
+## Nix CI correction after initial publication
+
+The first [PR #8 CI run](https://github.com/gentianster/ShojiWM/actions/runs/42827952426) exposed a Nix packaging mismatch that the earlier locally blocked evaluation had not checked: `nix/package.nix` still specified `xwayland-satellite-0.8.2` and the old upstream checkout hash, while `Cargo.lock` intentionally retained fork satellite `0.8.3` at `06511b6d08665ed55f4966f2e24fa387e58c9d17`. The evaluation failed with "A hash was specified for xwayland-satellite-0.8.2, but there is no corresponding git dependency."
+
+The minimal correction updates that key to `0.8.3` and all three satellite-workspace entries (`xwayland-satellite`, `macros`, `wl_drm`) to `sha256-IRO/5KV88Dn15Kx3dMNcJtJAmBWUA3i2uYqMo+UBCsE=`. Rust/SDK source, dependency revisions and lockfiles are unchanged; no live files or services are changed.
+
+The new hash was computed from an exact tracked Git-source export with `nix hash path`, without using the Nix daemon or store. This method reproduced the previous satellite hash from its exact old upstream revision, and also reproduced the unchanged Smithay and rustyscript hashes. A separate read-only NAR serialization directly from Git objects independently agreed. All six Nix Git-crate keys now exactly match `Cargo.lock`, and crates sharing a Git revision share a hash. Syntax parsing and whitespace checks passed. Full evaluation is left to the next GitHub run; this local check does not claim an evaluation/build pass. Hash evidence is retained under `target/integration-verification-20261110/nix-pin/`.
 
 ## Review, remaining edges and next decision
 
