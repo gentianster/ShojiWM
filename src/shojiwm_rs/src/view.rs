@@ -32,11 +32,10 @@ use shojiwm_lib::{
     ssd::{
         BoxNode, ButtonNode, DecorationInteractionHandlers, DecorationNode, DecorationNodeKind,
         DecorationStateChangeHandler, DecorationStyle, ImageFit, ImageNode, LabelNode,
-        LayoutDirection, ManagedWindowRectSnapshot, ManagedWindowState, PopupAlign,
-        PopupCollision, PopupDismissHandlers, PopupDismissReason, PopupHandlers, PopupLayer,
-        PopupMode, PopupNode, PopupPlacement, ShaderEffectNode,
-        ShaderUniformValue, TransformOrigin, WindowAction, WindowBorderInteraction,
-        WindowResizeHitArea, WindowTransform,
+        LayoutDirection, ManagedWindowRectSnapshot, ManagedWindowState, PopupAlign, PopupCollision,
+        PopupDismissHandlers, PopupDismissReason, PopupHandlers, PopupLayer, PopupMode, PopupNode,
+        PopupPlacement, ShaderEffectNode, ShaderUniformValue, TransformOrigin, WindowAction,
+        WindowBorderInteraction, WindowResizeHitArea, WindowTransform,
     },
 };
 
@@ -133,16 +132,25 @@ enum ClickAction {
 
 #[derive(Clone)]
 enum ElementKind {
-    Box { direction: Prop<LayoutDirection> },
-    Label { text: Prop<String> },
+    Box {
+        direction: Prop<LayoutDirection>,
+    },
+    Label {
+        text: Prop<String>,
+    },
     Button,
     AppIcon,
-    Image { src: Prop<String>, fit: ImageFit },
+    Image {
+        src: Prop<String>,
+        fit: ImageFit,
+    },
     ShaderEffect {
         direction: Prop<LayoutDirection>,
         effect: Box<Effect>,
     },
-    WindowBorder { interaction: WindowBorderInteraction },
+    WindowBorder {
+        interaction: WindowBorderInteraction,
+    },
     WindowSlot,
     Popup {
         open: Prop<bool>,
@@ -209,8 +217,14 @@ impl Element {
     /// The paint shaders of this element with their patch stage indices.
     fn paint_shaders(&self) -> impl Iterator<Item = (usize, &PaintShader)> {
         [
-            (shojiwm_lib::runtime_api::PAINT_STAGE_INDEX, self.paint.as_deref()),
-            (shojiwm_lib::runtime_api::OVERLAY_STAGE_INDEX, self.overlay.as_deref()),
+            (
+                shojiwm_lib::runtime_api::PAINT_STAGE_INDEX,
+                self.paint.as_deref(),
+            ),
+            (
+                shojiwm_lib::runtime_api::OVERLAY_STAGE_INDEX,
+                self.overlay.as_deref(),
+            ),
         ]
         .into_iter()
         .filter_map(|(index, shader)| shader.map(|shader| (index, shader)))
@@ -354,7 +368,11 @@ impl Element {
                 let hover = state.clone();
                 element
                     .on_interest_change(move |interested| {
-                        let delay = if interested { open_delay_ms } else { close_delay_ms };
+                        let delay = if interested {
+                            open_delay_ms
+                        } else {
+                            close_delay_ms
+                        };
                         hover.set_after(interested, delay);
                     })
                     .popup_callbacks("trigger", |callbacks| callbacks.trigger = Some(state))
@@ -597,12 +615,13 @@ impl TriggerState {
             return;
         }
         let state = Rc::downgrade(self);
-        self.pending.set(Some(crate::animation::set_timeout(delay_ms, move || {
-            if let Some(state) = state.upgrade() {
-                state.pending.set(None);
-                state.open.set(open);
-            }
-        })));
+        self.pending
+            .set(Some(crate::animation::set_timeout(delay_ms, move || {
+                if let Some(state) = state.upgrade() {
+                    state.pending.set(None);
+                    state.open.set(open);
+                }
+            })));
     }
 }
 
@@ -752,7 +771,11 @@ impl ManagedWindow {
                 translate_y: transform.translate_y,
                 scale_x: transform.scale_x,
                 scale_y: transform.scale_y,
-                opacity: if visible && !idle { opacity as f32 } else { 0.0 },
+                opacity: if visible && !idle {
+                    opacity as f32
+                } else {
+                    0.0
+                },
             },
             surface_policy: None,
         }
@@ -812,6 +835,10 @@ pub(crate) struct ViewContext {
     pub handlers: Rc<RefCell<HandlerMap>>,
     /// Called on the first mark after the set was drained.
     pub on_dirty: Rc<dyn Fn()>,
+    /// Lengths in this view are multiplied by this ([`Window::set_ui_scale`]).
+    ///
+    /// [`Window::set_ui_scale`]: crate::window::Window::set_ui_scale
+    pub ui_scale: Rc<Cell<f64>>,
 }
 
 impl ViewContext {
@@ -891,20 +918,27 @@ fn child_id(parent: &str, index: usize, element: &Element) -> String {
 }
 
 /// The handler ids a popup node carries, matching `register_popup_handlers`.
-fn popup_handlers(id: &str, popup: &PopupNode, callbacks: &PopupCallbacks) -> Option<Box<PopupHandlers>> {
+fn popup_handlers(
+    id: &str,
+    popup: &PopupNode,
+    callbacks: &PopupCallbacks,
+) -> Option<Box<PopupHandlers>> {
     let dismissable = popup.mode == PopupMode::Auto
         && (callbacks.on_open_change.is_some() || callbacks.trigger.is_some());
     let handlers = PopupHandlers {
-        interest_change: callbacks.on_interest_change.as_ref().map(|_| DecorationStateChangeHandler {
-            true_handler: format!("{id}#popup.interest.true"),
-            false_handler: format!("{id}#popup.interest.false"),
+        interest_change: callbacks.on_interest_change.as_ref().map(|_| {
+            DecorationStateChangeHandler {
+                true_handler: format!("{id}#popup.interest.true"),
+                false_handler: format!("{id}#popup.interest.false"),
+            }
         }),
         anchor_press: callbacks
             .on_anchor_press
             .as_ref()
             .map(|_| format!("{id}#popup.anchor-press")),
         dismiss: dismissable.then(|| {
-            let handler = |reason: PopupDismissReason| format!("{id}#popup.dismiss.{}", reason.as_str());
+            let handler =
+                |reason: PopupDismissReason| format!("{id}#popup.dismiss.{}", reason.as_str());
             PopupDismissHandlers {
                 outside_press: handler(PopupDismissReason::OutsidePress),
                 escape: handler(PopupDismissReason::Escape),
@@ -924,8 +958,14 @@ fn register_popup_handlers(
 ) {
     if let Some(handler) = &callbacks.on_interest_change {
         let (on, off) = (handler.clone(), handler.clone());
-        context.register_handler(format!("{id}#popup.interest.true"), Rc::new(move || on(true)));
-        context.register_handler(format!("{id}#popup.interest.false"), Rc::new(move || off(false)));
+        context.register_handler(
+            format!("{id}#popup.interest.true"),
+            Rc::new(move || on(true)),
+        );
+        context.register_handler(
+            format!("{id}#popup.interest.false"),
+            Rc::new(move || off(false)),
+        );
     }
     if let Some(handler) = &callbacks.on_anchor_press {
         context.register_handler(format!("{id}#popup.anchor-press"), handler.clone());
@@ -965,7 +1005,10 @@ impl MountedNode {
         if let Some(ClickAction::Handler(handler)) = &element.on_click {
             context.register_handler(format!("{id}#click"), handler.clone());
         }
-        if let ElementKind::Popup { popup, callbacks, .. } = &element.kind {
+        if let ElementKind::Popup {
+            popup, callbacks, ..
+        } = &element.kind
+        {
             register_popup_handlers(context, &id, popup, callbacks);
         }
         for (name, handler) in [
@@ -1071,37 +1114,46 @@ impl MountedNode {
         let (kind, style) = self.observer.track(|| {
             // Reactive uniforms are tracked by their own binding (patched
             // alone); everything else belongs to the node.
-            let mut read = |stage_index: usize, name: &str, value: &Prop<Uniform>| {
-                match uniforms
-                    .iter()
-                    .find(|binding| binding.stage_index == stage_index && binding.name == name)
-                {
-                    Some(binding) => {
-                        let value: ShaderUniformValue = binding.observer.track(|| value.get()).into();
-                        *binding.last.borrow_mut() = Some(value.clone());
-                        value
-                    }
-                    None => untrack(|| value.get()).into(),
+            let mut read = |stage_index: usize, name: &str, value: &Prop<Uniform>| match uniforms
+                .iter()
+                .find(|binding| binding.stage_index == stage_index && binding.name == name)
+            {
+                Some(binding) => {
+                    let value: ShaderUniformValue = binding.observer.track(|| value.get()).into();
+                    *binding.last.borrow_mut() = Some(value.clone());
+                    value
                 }
+                None => untrack(|| value.get()).into(),
             };
             let mut style = element.style.resolve();
-            style.paint = element
-                .paint
-                .as_ref()
-                .map(|shader| shader.compile(&mut read, shojiwm_lib::runtime_api::PAINT_STAGE_INDEX));
-            style.overlay = element
-                .overlay
-                .as_ref()
-                .map(|shader| shader.compile(&mut read, shojiwm_lib::runtime_api::OVERLAY_STAGE_INDEX));
+            let ui_scale = context.ui_scale.get();
+            if ui_scale != 1.0 {
+                // A label's text defaults are filled in by the layout, not the
+                // style; spell them out so they scale with everything else.
+                if matches!(element.kind, ElementKind::Label { .. }) {
+                    style.fill_label_text_defaults();
+                }
+                style.scale_lengths(ui_scale);
+            }
+            style.paint = element.paint.as_ref().map(|shader| {
+                shader.compile(&mut read, shojiwm_lib::runtime_api::PAINT_STAGE_INDEX)
+            });
+            style.overlay = element.overlay.as_ref().map(|shader| {
+                shader.compile(&mut read, shojiwm_lib::runtime_api::OVERLAY_STAGE_INDEX)
+            });
             let kind = match &element.kind {
                 ElementKind::Box { direction } => DecorationNodeKind::Box(BoxNode {
                     direction: direction.get(),
                 }),
-                ElementKind::Label { text } => DecorationNodeKind::Label(LabelNode { text: text.get() }),
+                ElementKind::Label { text } => {
+                    DecorationNodeKind::Label(LabelNode { text: text.get() })
+                }
                 ElementKind::Button => DecorationNodeKind::Button(ButtonNode {
                     action: match &element.on_click {
                         Some(ClickAction::Window(action)) => action.clone(),
-                        Some(ClickAction::Handler(_)) => WindowAction::RuntimeHandler(format!("{id}#click")),
+                        Some(ClickAction::Handler(_)) => {
+                            WindowAction::RuntimeHandler(format!("{id}#click"))
+                        }
                         None => WindowAction::RuntimeHandler(format!("{id}#none")),
                     },
                 }),
@@ -1121,6 +1173,7 @@ impl MountedNode {
                 ElementKind::WindowSlot => DecorationNodeKind::WindowSlot,
                 ElementKind::Popup { open, popup, .. } => DecorationNodeKind::Popup(PopupNode {
                     open: open.get(),
+                    offset: popup.offset * ui_scale,
                     ..*popup
                 }),
             };
@@ -1128,16 +1181,23 @@ impl MountedNode {
         });
 
         let interaction = DecorationInteractionHandlers {
-            hover_change: element.on_hover_change.as_ref().map(|_| DecorationStateChangeHandler {
-                true_handler: format!("{id}#hover.true"),
-                false_handler: format!("{id}#hover.false"),
-            }),
-            active_change: element.on_active_change.as_ref().map(|_| DecorationStateChangeHandler {
-                true_handler: format!("{id}#active.true"),
-                false_handler: format!("{id}#active.false"),
+            hover_change: element
+                .on_hover_change
+                .as_ref()
+                .map(|_| DecorationStateChangeHandler {
+                    true_handler: format!("{id}#hover.true"),
+                    false_handler: format!("{id}#hover.false"),
+                }),
+            active_change: element.on_active_change.as_ref().map(|_| {
+                DecorationStateChangeHandler {
+                    true_handler: format!("{id}#active.true"),
+                    false_handler: format!("{id}#active.false"),
+                }
             }),
             popup: match &element.kind {
-                ElementKind::Popup { popup, callbacks, .. } => popup_handlers(&id, popup, callbacks),
+                ElementKind::Popup {
+                    popup, callbacks, ..
+                } => popup_handlers(&id, popup, callbacks),
                 _ => None,
             },
         };
@@ -1226,7 +1286,12 @@ impl MountedNode {
             .paint_shaders()
             .find(|(index, _)| *index == stage_index)
         {
-            Some((_, shader)) => shader.uniform_props().find(|(candidate, _)| *candidate == name)?.1,
+            Some((_, shader)) => {
+                shader
+                    .uniform_props()
+                    .find(|(candidate, _)| *candidate == name)?
+                    .1
+            }
             None => {
                 let ElementKind::ShaderEffect { effect, .. } = &self.element.kind else {
                     return None;
@@ -1234,7 +1299,10 @@ impl MountedNode {
                 let (_, stage) = effect
                     .shader_stages()
                     .find(|(index, _)| *index == stage_index)?;
-                stage.uniform_props().find(|(candidate, _)| *candidate == name)?.1
+                stage
+                    .uniform_props()
+                    .find(|(candidate, _)| *candidate == name)?
+                    .1
             }
         };
         let value: ShaderUniformValue = binding.observer.track(|| prop.get()).into();
@@ -1404,4 +1472,106 @@ fn replace_uniform(
 /// The style a node would get, for tests and debugging.
 pub fn resolve_style(style: &Style) -> DecorationStyle {
     style.resolve()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reactive::Scope;
+    use shojiwm_lib::ssd::{DecorationHitTestResult, DecorationTree, LogicalPoint, LogicalRect};
+
+    /// A 100×60 view with a 20×20 close button at (10, 10), built at `scale`.
+    fn build_at(scale: f64) -> DecorationNode {
+        Scope::root().run(|| {
+            let context = ViewContext {
+                dirty: Default::default(),
+                handlers: Default::default(),
+                on_dirty: Rc::new(|| {}),
+                ui_scale: Rc::new(Cell::new(scale)),
+            };
+            let element = Flex::row()
+                .style(Style::new().size(100.0, 60.0))
+                .child(
+                    Flex::row()
+                        .style(Style::new().absolute().inset(0.0).pointer_events_none())
+                        .child(ClientWindow::new()),
+                )
+                .child(
+                    Button::new().on_click_action(WindowAction::Close).style(
+                        Style::new()
+                            .absolute()
+                            .left(10.0)
+                            .top(10.0)
+                            .size(20.0, 20.0),
+                    ),
+                );
+            MountedNode::mount(element, "root".into(), &context).build(&context)
+        })
+    }
+
+    /// The laid-out size of a label with `style`, built at `scale`: its width
+    /// beside the client in a row, its height above it in a column (the
+    /// other axis is stretched).
+    fn label_size_at(scale: f64, style: Style) -> (i32, i32) {
+        (
+            label_rect_at(scale, style.clone(), Flex::row()).width,
+            label_rect_at(scale, style, Flex::column()).height,
+        )
+    }
+
+    fn label_rect_at(scale: f64, style: Style, parent: Element) -> LogicalRect {
+        let node = Scope::root().run(|| {
+            let context = ViewContext {
+                dirty: Default::default(),
+                handlers: Default::default(),
+                on_dirty: Rc::new(|| {}),
+                ui_scale: Rc::new(Cell::new(scale)),
+            };
+            let element = parent
+                .child(Label::new("Hello World").style(style))
+                .child(ClientWindow::new());
+            MountedNode::mount(element, "root".into(), &context).build(&context)
+        });
+        let layout = DecorationTree::new(node)
+            .layout(LogicalRect::new(0, 0, 800, 400))
+            .expect("layout should succeed");
+        layout.root.children[0].rect
+    }
+
+    #[test]
+    fn ui_scale_scales_label_text_defaults() {
+        // A label that sets no font size or line height grows like one that
+        // spells the defaults out.
+        let explicit = Style::new().font_size(13.0).line_height(17.0);
+        for scale in [1.5, 2.0] {
+            assert_eq!(
+                label_size_at(scale, Style::new()),
+                label_size_at(scale, explicit.clone())
+            );
+        }
+        let (width, height) = label_size_at(1.0, Style::new());
+        let (scaled_width, scaled_height) = label_size_at(2.0, Style::new());
+        assert!(
+            (scaled_width - 2 * width).abs() <= 2,
+            "{width} -> {scaled_width}"
+        );
+        assert_eq!(scaled_height, 2 * height);
+    }
+
+    #[test]
+    fn ui_scale_multiplies_layout_and_hit_testing() {
+        let at = |scale: f64, x: i32, y: i32| {
+            let layout = DecorationTree::new(build_at(scale))
+                .layout(LogicalRect::new(0, 0, 400, 400))
+                .expect("layout should succeed");
+            layout.hit_test(LogicalPoint::new(x, y))
+                == DecorationHitTestResult::Action(WindowAction::Close)
+        };
+        // Unscaled: the button covers 10..30.
+        assert!(at(1.0, 12, 12) && at(1.0, 28, 28) && !at(1.0, 35, 35));
+        // At 2: 20..60, so (12, 12) misses and (55, 55) hits.
+        assert!(!at(2.0, 12, 12) && at(2.0, 22, 22) && at(2.0, 55, 55) && !at(2.0, 65, 65));
+        // At 1.5: 15..45.
+        assert!(!at(1.5, 12, 12) && at(1.5, 17, 17) && at(1.5, 43, 43) && !at(1.5, 48, 48));
+    }
 }

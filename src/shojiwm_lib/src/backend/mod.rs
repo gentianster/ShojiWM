@@ -12,8 +12,9 @@ pub mod fps_counter;
 pub mod hdr_cursor;
 pub mod hdr_pipeline;
 pub mod icon;
-pub mod overlay;
 pub mod image_copy_capture_render;
+pub mod lock_scene;
+pub mod overlay;
 pub mod paint;
 pub mod scene3d;
 pub mod screencopy_render;
@@ -73,12 +74,27 @@ impl ShojiWMBackend {
     }
 }
 
+/// Takes a window's close snapshot from what it shows now, with whichever backend is
+/// running. Called right before a close can take that content away: a close request, the
+/// client's unmap (a null buffer commit) and the toplevel's destruction.
+pub(crate) fn capture_live_snapshot_for_close(
+    state: &mut ShojiWM,
+    window: &smithay::desktop::Window,
+) -> Result<bool, smithay::backend::renderer::gles::GlesError> {
+    if state.winit_backend.is_some() {
+        winit::capture_live_snapshot_for_close(state, window)
+    } else {
+        tty::capture_live_snapshot_for_close(state, window)
+    }
+}
+
 fn tty_maintenance_debug_enabled() -> bool {
     std::env::var_os("SHOJI_TTY_MAINTENANCE_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std::error::Error>> {
+    crate::activation_environment::disable_by_default();
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display, &runtime);
@@ -100,7 +116,9 @@ fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std
     Ok(())
 }
 
-pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_tty_udev(
+    runtime: crate::runtime_api::RuntimeBoot,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display, &runtime);
@@ -146,6 +164,9 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
             SessionEvent::ActivateSession => {
                 info!("resuming tty session");
                 state.tty_session_active = true;
+                // Keys and buttons let go on another VT sent us no release.
+                state.modifier_tap.reset();
+                state.consumed_pointer_buttons.clear();
                 if let Err(err) = libinput.resume() {
                     warn!(?err, "failed to resume libinput context");
                 }
@@ -298,7 +319,7 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
                         // post-resume commit then fails its atomic test
                         // against the stale state. Re-run after resume.
                         info!(
-                            ?node, 
+                            ?node,
                             "tty session paused; deferring drm device change",
                         );
                         if !state.pending_tty_device_changes
@@ -473,11 +494,10 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
             if crate::backend::tty::render_error_is_config_caused(err.as_ref()) {
                 error!(error = ?err, "tty render iteration failed on a config-caused effect error; continuing");
                 if state.config_error_report.is_none() {
-                    state.config_error_report = Some(
-                        crate::config_error::ConfigErrorReport::runtime(format!(
+                    state.config_error_report =
+                        Some(crate::config_error::ConfigErrorReport::runtime(format!(
                             "rendering failed because of an effect in the config: {err}"
-                        )),
-                    );
+                        )));
                 }
             } else {
                 error!(error = ?err, "tty render iteration failed; shutting down");

@@ -3,7 +3,10 @@
 //! Each option also has an environment variable so session wrappers (Nix,
 //! display managers) can set defaults; the command line wins.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 /// An option a runtime adds on top of the common ones (`--name <value>`).
 #[derive(Debug, Clone, Copy)]
@@ -44,15 +47,27 @@ impl CommonArgs {
 
     pub fn parse(args: &[String], extra_args: &[ArgSpec]) -> Self {
         let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-        let env_flag_off = |name: &str| {
-            std::env::var_os(name).is_some_and(|value| value == "off" || value == "0")
+        let env_flag_off =
+            |name: &str| std::env::var_os(name).is_some_and(|value| value == "off" || value == "0");
+        let mut value_options = vec![
+            "--tty-output".to_string(),
+            "--config".to_string(),
+            "--runtime-dir".to_string(),
+            "--xwayland-satellite-path".to_string(),
+            "--xwayland-satellite-glamor".to_string(),
+        ];
+        value_options.extend(extra_args.iter().map(|spec| format!("--{}", spec.name)));
+        let consumed_values = consumed_value_indices(args, &value_options);
+        let flag = |name: &str| {
+            args.iter()
+                .enumerate()
+                .any(|(index, arg)| !consumed_values.contains(&index) && arg == name)
         };
-        let flag = |name: &str| args.iter().any(|arg| arg == name);
 
         let extra = extra_args
             .iter()
             .filter_map(|spec| {
-                parse_option_value(args, &format!("--{}", spec.name))
+                parse_option_value(args, &format!("--{}", spec.name), &consumed_values)
                     .or_else(|| spec.env.and_then(env))
                     .map(|value| (spec.name.to_string(), value))
             })
@@ -62,17 +77,25 @@ impl CommonArgs {
             tty: flag("--tty"),
             log_off: flag("--log-off") || env_flag_off("SHOJI_LOG"),
             no_log_rotate: flag("--no-log-rotate") || env_flag_off("SHOJI_LOG_ROTATE"),
-            tty_outputs: parse_tty_outputs(args),
-            xwayland_satellite_path: parse_option_value(args, "--xwayland-satellite-path")
-                .or_else(|| env("SHOJI_XWAYLAND_SATELLITE_PATH")),
-            xwayland_satellite_glamor: parse_option_value(args, "--xwayland-satellite-glamor")
-                .or_else(|| env("SHOJI_XWAYLAND_SATELLITE_GLAMOR"))
-                .filter(|value| matches!(value.as_str(), "gl" | "es" | "none")),
+            tty_outputs: parse_tty_outputs(args, &consumed_values),
+            xwayland_satellite_path: parse_option_value(
+                args,
+                "--xwayland-satellite-path",
+                &consumed_values,
+            )
+            .or_else(|| env("SHOJI_XWAYLAND_SATELLITE_PATH")),
+            xwayland_satellite_glamor: parse_option_value(
+                args,
+                "--xwayland-satellite-glamor",
+                &consumed_values,
+            )
+            .or_else(|| env("SHOJI_XWAYLAND_SATELLITE_GLAMOR"))
+            .filter(|value| matches!(value.as_str(), "gl" | "es" | "none")),
             dev: flag("--dev"),
-            config_path: parse_option_value(args, "--config")
+            config_path: parse_option_value(args, "--config", &consumed_values)
                 .or_else(|| env("SHOJI_CONFIG"))
                 .map(PathBuf::from),
-            runtime_dir: parse_option_value(args, "--runtime-dir")
+            runtime_dir: parse_option_value(args, "--runtime-dir", &consumed_values)
                 .or_else(|| env("SHOJI_RUNTIME_DIR"))
                 .map(PathBuf::from),
             extra,
@@ -90,17 +113,41 @@ impl CommonArgs {
 }
 
 const COMMON_HELP: &[(&str, &str)] = &[
-    ("--tty", "Run on the console (DRM/KMS) instead of nested in another compositor"),
-    ("--tty-output <NAME,...>", "Only drive these connectors [SHOJI_TTY_OUTPUT]"),
+    (
+        "--tty",
+        "Run on the console (DRM/KMS) instead of nested in another compositor",
+    ),
+    (
+        "--tty-output <NAME,...>",
+        "Only drive these connectors [SHOJI_TTY_OUTPUT]",
+    ),
     ("--config <PATH>", "Config entry point [SHOJI_CONFIG]"),
-    ("--runtime-dir <DIR>", "Directory with the config runtime's files [SHOJI_RUNTIME_DIR]"),
+    (
+        "--runtime-dir <DIR>",
+        "Directory with the config runtime's files [SHOJI_RUNTIME_DIR]",
+    ),
     ("--dev", "Run from a source checkout"),
     ("--log-off", "Disable the session log [SHOJI_LOG=off]"),
-    ("--no-log-rotate", "Overwrite latest.log instead of rotating it [SHOJI_LOG_ROTATE=off]"),
-    ("--xwayland-satellite-path <PATH>", "External xwayland-satellite binary [SHOJI_XWAYLAND_SATELLITE_PATH]"),
-    ("--xwayland-satellite-glamor <gl|es|none>", "Glamor mode for Xwayland [SHOJI_XWAYLAND_SATELLITE_GLAMOR]"),
-    ("-q, --quit", "Quit the running ShojiWM (same as Super+Shift+Q)"),
-    ("-r, --reload", "Reload the running ShojiWM's config (same as Super+Shift+R)"),
+    (
+        "--no-log-rotate",
+        "Overwrite latest.log instead of rotating it [SHOJI_LOG_ROTATE=off]",
+    ),
+    (
+        "--xwayland-satellite-path <PATH>",
+        "External xwayland-satellite binary [SHOJI_XWAYLAND_SATELLITE_PATH]",
+    ),
+    (
+        "--xwayland-satellite-glamor <gl|es|none>",
+        "Glamor mode for Xwayland [SHOJI_XWAYLAND_SATELLITE_GLAMOR]",
+    ),
+    (
+        "-q, --quit",
+        "Quit the running ShojiWM (same as Super+Shift+Q)",
+    ),
+    (
+        "-r, --reload",
+        "Reload the running ShojiWM's config (same as Super+Shift+R)",
+    ),
     ("-h, --help", "Print this help"),
     ("-V, --version", "Print the version"),
 ];
@@ -121,7 +168,9 @@ pub fn help_text(binary: &str, runtime_name: &str, extra_args: &[ArgSpec]) -> St
         .max()
         .unwrap_or(0);
 
-    let mut text = format!("ShojiWM ({runtime_name} config runtime)\n\nUsage: {binary} [OPTIONS]\n\nOptions:\n");
+    let mut text = format!(
+        "ShojiWM ({runtime_name} config runtime)\n\nUsage: {binary} [OPTIONS]\n\nOptions:\n"
+    );
     for (option, help) in COMMON_HELP {
         text.push_str(&format!("  {option:width$}  {help}\n"));
     }
@@ -134,12 +183,15 @@ pub fn help_text(binary: &str, runtime_name: &str, extra_args: &[ArgSpec]) -> St
     text
 }
 
-fn parse_tty_outputs(args: &[String]) -> Vec<String> {
+fn parse_tty_outputs(args: &[String], consumed_values: &BTreeSet<usize>) -> Vec<String> {
     let mut outputs = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if let Some(value) = arg.strip_prefix("--tty-output=") {
+        if consumed_values.contains(&index) {
+            index += 1;
+            continue;
+        } else if let Some(value) = arg.strip_prefix("--tty-output=") {
             outputs.extend(split_tty_outputs(value));
         } else if arg == "--tty-output"
             && let Some(value) = args.get(index + 1)
@@ -161,11 +213,18 @@ fn split_tty_outputs(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_option_value(args: &[String], option: &str) -> Option<String> {
+fn parse_option_value(
+    args: &[String],
+    option: &str,
+    consumed_values: &BTreeSet<usize>,
+) -> Option<String> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if let Some(value) = arg.strip_prefix(&format!("{option}=")) {
+        if consumed_values.contains(&index) {
+            index += 1;
+            continue;
+        } else if let Some(value) = arg.strip_prefix(&format!("{option}=")) {
             if !value.is_empty() {
                 return Some(value.to_string());
             }
@@ -177,6 +236,20 @@ fn parse_option_value(args: &[String], option: &str) -> Option<String> {
         index += 1;
     }
     None
+}
+
+fn consumed_value_indices(args: &[String], value_options: &[String]) -> BTreeSet<usize> {
+    let mut consumed = BTreeSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        if value_options.iter().any(|option| option == &args[index]) && index + 1 < args.len() {
+            consumed.insert(index + 1);
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    consumed
 }
 
 #[cfg(test)]
@@ -211,6 +284,60 @@ mod tests {
         assert_eq!(
             parsed.extra.get("decoration-runtime").map(String::as_str),
             Some("/tmp/runtime.ts")
+        );
+    }
+
+    #[test]
+    fn option_values_are_not_reparsed_as_flags() {
+        const EXTRA: &[ArgSpec] = &[ArgSpec {
+            name: "decoration-runtime",
+            env: None,
+            value_name: "PATH",
+            help: "",
+        }];
+        let parsed = CommonArgs::parse(
+            &args(&[
+                "--config",
+                "--quit",
+                "--runtime-dir",
+                "-h",
+                "--tty-output",
+                "--dev",
+                "--xwayland-satellite-path",
+                "--reload",
+                "--xwayland-satellite-glamor",
+                "--tty",
+                "--decoration-runtime",
+                "-V",
+            ]),
+            EXTRA,
+        );
+
+        assert_eq!(parsed.config_path, Some(PathBuf::from("--quit")));
+        assert_eq!(parsed.runtime_dir, Some(PathBuf::from("-h")));
+        assert_eq!(parsed.tty_outputs, ["--dev"]);
+        assert_eq!(parsed.xwayland_satellite_path.as_deref(), Some("--reload"));
+        assert_eq!(parsed.xwayland_satellite_glamor, None);
+        assert_eq!(
+            parsed.extra.get("decoration-runtime").map(String::as_str),
+            Some("-V")
+        );
+        assert!(!parsed.tty);
+        assert!(!parsed.dev);
+        assert!(!parsed.help);
+        assert!(!parsed.version);
+        assert_eq!(parsed.control_command, None);
+    }
+
+    #[test]
+    fn flags_after_option_values_are_still_parsed() {
+        let parsed = CommonArgs::parse(&args(&["--config", "--quit", "--dev", "--quit"]), &[]);
+
+        assert_eq!(parsed.config_path, Some(PathBuf::from("--quit")));
+        assert!(parsed.dev);
+        assert_eq!(
+            parsed.control_command,
+            Some(crate::control_socket::Command::Quit)
         );
     }
 }

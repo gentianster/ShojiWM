@@ -4,6 +4,19 @@ sidebar_position: 6
 
 # Processes & Environment
 
+## Session logs
+
+Session logs and Timescope profiles are stored in `$XDG_STATE_HOME/shoji_wm/logs/`,
+with `~/.local/state/shoji_wm/logs/` as the default. An empty or relative
+`XDG_STATE_HOME` is ignored. Set `SHOJI_LOG_DIR` before starting the compositor
+to override the complete directory; a relative override is resolved from its
+working directory. An empty override is ignored.
+
+The current session log is `latest.log`. Rotation and retention apply within
+the selected directory. The default-path change does not migrate or delete
+files under `~/shoji_wm/logs/`. Set `SHOJI_LOG_DIR` to that path to keep using
+it; normal rotation and retention then apply there.
+
 ## Spawning processes
 
 `COMPOSITOR.process` launches external programs. There are three methods,
@@ -78,6 +91,34 @@ Every method takes a spec with a `command`, plus optional `cwd` and `env`:
   ```ts
   COMPOSITOR.process.spawn({command: ['kitty', '--title', 'My Terminal']});
   ```
+
+## Starting locked
+
+`COMPOSITOR.session.startLocked = true` starts the compositor with the session
+already locked: nothing but ext-session-lock surfaces is drawn, and input
+reaches only them, until a locker locks and then unlocks. With automatic login,
+the lock screen becomes the login screen and the desktop never shows first.
+
+ShojiWM does not draw a lock screen itself, so start a locker from the config —
+any ext-session-lock client works (Quickshell's `WlSessionLock`, hyprlock,
+swaylock, ...):
+
+```ts
+COMPOSITOR.session.startLocked = true;
+COMPOSITOR.process.once('locker', { command: ['hyprlock'] });
+```
+
+- Set it at the top level of the config. It is read once, when the config first
+  loads; a hot reload never locks a running session.
+- Until the locker connects, the screen stays black.
+- A config that fails to load starts unlocked, since its locker would not start
+  either.
+- If the locker never shows up, `Ctrl+Alt+F<n>` still switches to another VT
+  while locked.
+- Only one client can hold the lock. Another client that asks to lock is
+  refused, and so cannot unlock it. If the locker dies, the session stays
+  locked until a new locker takes over.
+- A Rust config does the same with `ConfigBuilder::start_locked(true)`.
 
 ## Environment variables
 

@@ -8,11 +8,10 @@ use std::collections::BTreeMap;
 use super::{
     ConfigRuntime, DecorationRequest, EffectRequest, InputRequest, NullRuntime, ReloadPreparation,
     RuntimeError, RuntimeEvent, RuntimeHost, RuntimeReply, RuntimeRequest, SchedulerTickRequest,
-    WindowRequest,
-    WorkspaceRequest,
+    WindowRequest, WorkspaceRequest,
 };
 use crate::{
-    keyboard_layout::KeyboardLayoutSnapshot,
+    keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
     runtime_input::RuntimeInputDeviceSnapshot,
     runtime_workspace::RuntimeWorkspaceActivateRequestSnapshot,
     ssd::{
@@ -24,10 +23,10 @@ use crate::{
         LayerEffectEvaluationResult, PointerMoveEventSnapshot, PopupEffectEvaluationResult,
         StaticDecorationEvaluator, WaylandLayerSnapshot, WaylandOutputSnapshot,
         WaylandPopupSnapshot, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
-        WindowDecorationDecisionSnapshot, WindowDecorationModeSnapshot,
-        WindowDecorationPolicyContextSnapshot, WindowFullscreenRequestEventSnapshot,
-        WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
-        WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+        WindowDecorationClientSnapshot, WindowDecorationDecisionSnapshot,
+        WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot,
+        WindowFullscreenRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
+        WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
     },
 };
 
@@ -40,6 +39,7 @@ pub struct RuntimeHandle {
     display_state: Option<BTreeMap<String, WaylandOutputSnapshot>>,
     input_state: Option<BTreeMap<String, RuntimeInputDeviceSnapshot>>,
     keyboard_layout: Option<KeyboardLayoutSnapshot>,
+    keyboard_locks: Option<KeyboardLocksSnapshot>,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -69,6 +69,7 @@ impl RuntimeHandle {
             display_state: None,
             input_state: None,
             keyboard_layout: None,
+            keyboard_locks: None,
         }
     }
 
@@ -138,12 +139,23 @@ impl RuntimeHandle {
         true
     }
 
+    /// Returns whether the lock keys differ from the last state sent.
+    pub fn sync_keyboard_locks(&mut self, locks: KeyboardLocksSnapshot) -> bool {
+        if self.keyboard_locks == Some(locks) {
+            return false;
+        }
+        self.keyboard_locks = Some(locks);
+        self.post(0.0, RuntimeEvent::KeyboardLocks(locks));
+        true
+    }
+
     /// Forget what was sent, so the next sync re-sends everything. Used after
     /// a reload, whose fresh config has not seen any state yet.
     pub fn reset_synced_state(&mut self) {
         self.display_state = None;
         self.input_state = None;
         self.keyboard_layout = None;
+        self.keyboard_locks = None;
     }
 
     pub fn evaluate_window(
@@ -188,6 +200,20 @@ impl RuntimeHandle {
                 mode: WindowDecorationModeSnapshot::Server,
             }),
             other => Err(mismatch("decoration policy", &other)),
+        }
+    }
+
+    /// The legacy KDE decoration manager's default mode for `client`; CSD
+    /// unless the config chooses.
+    pub fn kde_default_decoration_mode(
+        &mut self,
+        client: &WindowDecorationClientSnapshot,
+    ) -> Result<WindowDecorationModeSnapshot, RuntimeError> {
+        let request = RuntimeRequest::Decoration(DecorationRequest::KdeDefaultMode { client });
+        match self.request(0.0, request)? {
+            RuntimeReply::DecorationPolicy(decision) => Ok(decision.mode),
+            RuntimeReply::Unhandled => Ok(WindowDecorationModeSnapshot::Client),
+            other => Err(mismatch("kde default decoration mode", &other)),
         }
     }
 
@@ -435,6 +461,14 @@ impl RuntimeHandle {
         self.post(now_ms as f64, RuntimeEvent::GestureSwipe(event));
     }
 
+    pub fn gesture_pinch_async(
+        &mut self,
+        event: crate::ssd::GesturePinchEventSnapshot,
+        now_ms: u64,
+    ) {
+        self.post(now_ms as f64, RuntimeEvent::GesturePinch(event));
+    }
+
     pub fn pointer_region(
         &mut self,
         event: &crate::runtime_pointer_region::PointerRegionEventSnapshot,
@@ -457,7 +491,11 @@ impl RuntimeHandle {
         event: &crate::runtime_input_grab::InputGrabEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationPointerMoveAsyncInvocation, RuntimeError> {
-        self.pointer_hook_reply("input grab", now_ms, InputRequest::InputGrab { grab_id, event })
+        self.pointer_hook_reply(
+            "input grab",
+            now_ms,
+            InputRequest::InputGrab { grab_id, event },
+        )
     }
 
     pub fn background_effect_config(

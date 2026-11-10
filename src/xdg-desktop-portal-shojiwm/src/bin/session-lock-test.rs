@@ -1,7 +1,11 @@
 //! Debug helper: lock the session via ext-session-lock-v1 for a few seconds
 //! and then unlock, the way swaylock/hyprlock do (minus the password).
 //!
-//!   WAYLAND_DISPLAY=wayland-2 session-lock-test [seconds]
+//!   WAYLAND_DISPLAY=wayland-2 session-lock-test [seconds] [--unlock-anyway]
+//!
+//! `--unlock-anyway` sends `unlock_and_destroy` even when the compositor
+//! refused the lock (`finished`), the way a hostile client would try to
+//! unlock someone else's lock.
 //!
 //! One lock surface (a blank shm buffer) is created per wl_output so the
 //! compositor goes through its normal lock-surface focus path.
@@ -33,7 +37,9 @@ struct App {
 
 impl App {
     fn stamp(&self) -> String {
-        let elapsed = self.start.map_or(0.0, |start| start.elapsed().as_secs_f64());
+        let elapsed = self
+            .start
+            .map_or(0.0, |start| start.elapsed().as_secs_f64());
         format!("[{elapsed:7.3}s]")
     }
 }
@@ -68,15 +74,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                 "wl_output" => {
                     state
                         .outputs
-                        .push(registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ()));
+                        .push(registry.bind::<wl_output::WlOutput, _, _>(
+                            name,
+                            version.min(4),
+                            qh,
+                            (),
+                        ));
                 }
                 "ext_session_lock_manager_v1" => {
-                    state.manager = Some(registry.bind::<ExtSessionLockManagerV1, _, _>(
-                        name,
-                        1,
-                        qh,
-                        (),
-                    ));
+                    state.manager =
+                        Some(registry.bind::<ExtSessionLockManagerV1, _, _>(name, 1, qh, ()));
                 }
                 _ => {}
             }
@@ -107,7 +114,10 @@ impl Dispatch<ExtSessionLockV1, ()> for App {
                 state.locked = true;
             }
             ext_session_lock_v1::Event::Finished => {
-                println!("{} finished (compositor refused or ended the lock)", state.stamp());
+                println!(
+                    "{} finished (compositor refused or ended the lock)",
+                    state.stamp()
+                );
                 state.finished = true;
             }
             _ => {}
@@ -175,7 +185,11 @@ fn main() {
     let manager = app.manager.clone().expect("no ext_session_lock_manager_v1");
     let compositor = app.compositor.clone().expect("wl_compositor");
     let lock = manager.lock(&qh, ());
-    println!("{} lock requested for {} outputs", app.stamp(), app.outputs.len());
+    println!(
+        "{} lock requested for {} outputs",
+        app.stamp(),
+        app.outputs.len()
+    );
     for output in app.outputs.clone() {
         let surface = compositor.create_surface(&qh, ());
         let lock_surface = lock.get_lock_surface(&surface, &output, &qh, surface.clone());
@@ -191,11 +205,14 @@ fn main() {
         queue.dispatch_pending(&mut app).expect("dispatch");
         std::thread::sleep(Duration::from_millis(20));
     }
-    if app.finished {
+    let unlock_anyway = std::env::args().any(|arg| arg == "--unlock-anyway");
+    if app.finished && !unlock_anyway {
         std::process::exit(1);
     }
     println!("{} unlock_and_destroy", app.stamp());
     lock.unlock_and_destroy();
-    queue.roundtrip(&mut app).expect("roundtrip unlock");
-    println!("{} done", app.stamp());
+    match queue.roundtrip(&mut app) {
+        Ok(_) => println!("{} done", app.stamp()),
+        Err(error) => println!("{} disconnected: {error}", app.stamp()),
+    }
 }

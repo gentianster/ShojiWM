@@ -1,9 +1,10 @@
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
-            GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
-            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, Event, GestureBeginEvent,
+            GestureEndEvent, GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend,
+            InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+            PointerMotionEvent,
         },
         session::Session,
     },
@@ -31,15 +32,15 @@ use crate::{
         move_grab::MoveSurfaceGrab,
         resize_grab::{ResizeEdge, ResizeSurfaceGrab},
     },
-    ssd::{
-        DecorationHitTestResult, GestureSwipeEventSnapshot,
-        GestureSwipePhaseSnapshot, LogicalPoint, PointerModifierStateSnapshot,
-        PointerMoveEventSnapshot, PointerMovePointSnapshot, ResizeEdges, RuntimeWindowAction,
-        WindowAction, WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
-    },
     runtime_input_grab::{
         InputGrabEventSnapshot, InputGrabStateSnapshot, RuntimeInputGrabState,
         RuntimeInputGrabUpdate,
+    },
+    ssd::{
+        DecorationHitTestResult, GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
+        LogicalPoint, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
+        PointerMovePointSnapshot, ResizeEdges, RuntimeWindowAction, WindowAction,
+        WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
     },
     state::{ShojiWM, TrackedDecorationInteractionTarget},
 };
@@ -53,6 +54,31 @@ enum KeyboardAction {
     ChangeVt(i32),
     /// Escape closes the most recent `Auto` SSD popup.
     DismissPopup,
+}
+
+/// The VT `Ctrl+Alt+F<n>` switches to, if this key is one of them.
+fn vt_switch_target(
+    modifiers: &smithay::input::keyboard::ModifiersState,
+    handle: &smithay::input::keyboard::KeysymHandle<'_>,
+) -> Option<i32> {
+    if !modifiers.ctrl || !modifiers.alt || modifiers.shift || modifiers.logo {
+        return None;
+    }
+    match handle.raw_latin_sym_or_raw_current_sym()?.raw() {
+        keysyms::KEY_F1 => Some(1),
+        keysyms::KEY_F2 => Some(2),
+        keysyms::KEY_F3 => Some(3),
+        keysyms::KEY_F4 => Some(4),
+        keysyms::KEY_F5 => Some(5),
+        keysyms::KEY_F6 => Some(6),
+        keysyms::KEY_F7 => Some(7),
+        keysyms::KEY_F8 => Some(8),
+        keysyms::KEY_F9 => Some(9),
+        keysyms::KEY_F10 => Some(10),
+        keysyms::KEY_F11 => Some(11),
+        keysyms::KEY_F12 => Some(12),
+        _ => None,
+    }
 }
 
 fn compositor_pointer_grab_start_data(
@@ -283,19 +309,39 @@ impl ShojiWM {
         event: &I::KeyboardKeyEvent,
         serial: Serial,
     ) {
-        let _ = self.seat.get_keyboard().unwrap().input(
+        let pressed = event.state() == KeyState::Pressed;
+        let vt = self.seat.get_keyboard().unwrap().input(
             self,
             event.key_code(),
             event.state(),
             serial,
             Event::time_msec(event),
-            |data, modifiers, _handle| {
+            |data, modifiers, handle| {
                 data.current_keyboard_modifiers = *modifiers;
                 data.publish_xwayland_positions();
-                FilterResult::<KeyboardAction>::Forward
+                // VT switching stays available: it shows another VT, not the
+                // session, and it is the way out when the locker never shows
+                // up (e.g. a session started locked whose locker failed).
+                match vt_switch_target(modifiers, &handle).filter(|_| pressed) {
+                    Some(vt) => FilterResult::Intercept(vt),
+                    None => FilterResult::Forward,
+                }
             },
         );
+        if let Some(vt) = vt {
+            self.change_vt(vt);
+        }
         let _ = self.display_handle.flush_clients();
+    }
+
+    fn change_vt(&mut self, vt: i32) {
+        if let Some(ref mut session) = self.tty_session {
+            if let Err(err) = session.change_vt(vt) {
+                warn!(?err, vt, "failed to change VT");
+            }
+        } else {
+            debug!(vt, "ignoring VT change req (no tty  session)")
+        }
     }
 
     fn forward_locked_pointer_motion(
@@ -363,10 +409,7 @@ impl ShojiWM {
     fn run_runtime_key_binding(&mut self, binding_id: &str) {
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         self.sync_runtime_display_state();
-        match self
-            .config_runtime
-            .invoke_key_binding(binding_id, now_ms)
-        {
+        match self.config_runtime.invoke_key_binding(binding_id, now_ms) {
             Ok(invocation) => {
                 self.drain_runtime_host_messages();
                 if invocation.dirty {
@@ -399,7 +442,7 @@ impl ShojiWM {
         }
     }
 
-    fn dispatch_pointer_move_events(
+    pub(crate) fn dispatch_pointer_move_events(
         &mut self,
         previous_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
         pos: smithay::utils::Point<f64, smithay::utils::Logical>,
@@ -489,6 +532,8 @@ impl ShojiWM {
         if transitions.is_empty() {
             return;
         }
+        // The config hears about the motion before the region it led into.
+        self.flush_pointer_dispatch();
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         for transition in transitions {
             let event = PointerRegionEventSnapshot {
@@ -502,7 +547,11 @@ impl ShojiWM {
             match self.config_runtime.pointer_region(&event, now_ms) {
                 Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),
                 Err(error) => {
-                    tracing::warn!(?error, region = event.id, "runtime pointer region event failed");
+                    tracing::warn!(
+                        ?error,
+                        region = event.id,
+                        "runtime pointer region event failed"
+                    );
                 }
             }
         }
@@ -570,7 +619,10 @@ impl ShojiWM {
     /// motion would (focus, hover, pointer regions) without reporting it to
     /// `onPointerMove`. Ignored while a client holds the pointer locked or
     /// confined, while a button is held, and while the session is locked.
-    pub(crate) fn set_cursor_position(&mut self, target: crate::cursor::RuntimeCursorPositionTarget) {
+    pub(crate) fn set_cursor_position(
+        &mut self,
+        target: crate::cursor::RuntimeCursorPositionTarget,
+    ) {
         use crate::cursor::RuntimeCursorPositionTarget;
 
         let Some(pointer) = self.seat.get_pointer() else {
@@ -785,13 +837,20 @@ impl ShojiWM {
         let Some(grab) = self.runtime_input_grab.take() else {
             return;
         };
-        info!(grab_id = grab.id, reason = cancel_reason, "input grab ended");
+        info!(
+            grab_id = grab.id,
+            reason = cancel_reason,
+            "input grab ended"
+        );
         if let Some(reason) = cancel_reason {
             let event = InputGrabEventSnapshot::Cancel {
                 reason: reason.to_owned(),
             };
             let now_ms = self.input_grab_now_ms();
-            match self.config_runtime.input_grab_event(grab.id, &event, now_ms) {
+            match self
+                .config_runtime
+                .input_grab_event(grab.id, &event, now_ms)
+            {
                 Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),
                 Err(error) => warn!(?error, "runtime input grab cancel failed"),
             }
@@ -807,10 +866,16 @@ impl ShojiWM {
             return;
         };
         let now_ms = self.input_grab_now_ms();
-        match self.config_runtime.input_grab_event(grab_id, &event, now_ms) {
+        match self
+            .config_runtime
+            .input_grab_event(grab_id, &event, now_ms)
+        {
             Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),
             Err(error) => {
-                warn!(?error, "runtime input grab event failed; releasing the grab");
+                warn!(
+                    ?error,
+                    "runtime input grab event failed; releasing the grab"
+                );
                 self.end_runtime_input_grab(Some("error"));
             }
         }
@@ -915,6 +980,43 @@ impl ShojiWM {
         }
     }
 
+    fn dispatch_gesture_pinch(
+        &mut self,
+        phase: GestureSwipePhaseSnapshot,
+        timestamp: u64,
+        scale: f64,
+        rotation: f64,
+        delta_x: f64,
+        delta_y: f64,
+    ) {
+        if !self.runtime_gesture_pinch_async_enabled {
+            return;
+        }
+        let pointer_position = self
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
+        let output_name = pointer_position
+            .and_then(|position| self.output_at_point(position))
+            .map(|output| output.name());
+        let event = crate::ssd::GesturePinchEventSnapshot {
+            phase,
+            fingers: self.runtime_gesture_pinch_fingers,
+            scale,
+            rotation,
+            delta_x,
+            delta_y,
+            position: pointer_position.map(|position| PointerMovePointSnapshot {
+                x: position.x,
+                y: position.y,
+            }),
+            output_name,
+            timestamp,
+        };
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        self.config_runtime.gesture_pinch_async(event, now_ms);
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         // Any focus decision made under here traces back to a key press, a
         // pointer press or a gesture — including the config's own
@@ -923,8 +1025,25 @@ impl ShojiWM {
         // user asked for this window" from "an application asked for itself".
         // Saved and restored rather than cleared so the flag survives nesting.
         let previous = std::mem::replace(&mut self.user_input_in_flight, true);
+        let keyboard = matches!(event, InputEvent::Keyboard { .. });
+        let pointer_motion = matches!(
+            event,
+            InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. }
+        );
+        // The config must not see this event before the motion that led up to it.
+        if !pointer_motion {
+            self.flush_pointer_dispatch();
+        }
         self.process_input_event_inner(event);
+        if pointer_motion {
+            self.pump_pointer_dispatch();
+        }
         self.user_input_in_flight = previous;
+        // Caps Lock and Num Lock reach the config at once, not at the next
+        // scheduler tick.
+        if keyboard {
+            self.sync_keyboard_state();
+        }
         if !previous {
             self.input_woke_outputs = false;
         }
@@ -940,6 +1059,11 @@ impl ShojiWM {
         self.publish_xwayland_positions();
 
         match event {
+            InputEvent::DeviceRemoved { device } => {
+                let device_id = device.id();
+                self.consumed_pointer_buttons
+                    .retain(|(id, _)| id != &device_id);
+            }
             InputEvent::Keyboard { event, .. } => {
                 let device = event.device();
                 crate::runtime_input::apply_keyboard_config_for_backend_device(self, &device);
@@ -989,46 +1113,28 @@ impl ShojiWM {
                             let tap_class = handle
                                 .raw_latin_sym_or_raw_current_sym()
                                 .and_then(|sym| modifier_class_of_keysym(sym.raw()));
+                            let key = handle.raw_code().raw();
                             match key_phase {
                                 crate::runtime_key_binding::RuntimeKeyBindingPhase::Press => {
-                                    let was_idle = data.tap_pressed_keys == 0;
-                                    data.tap_pressed_keys += 1;
-                                    match tap_class {
-                                        Some(class) if was_idle => {
-                                            data.tap_armed_modifier = Some(class);
-                                            data.tap_armed_at = time;
-                                            data.tap_interrupted = false;
-                                        }
-                                        _ => {
-                                            data.tap_interrupted = true;
-                                        }
-                                    }
+                                    data.modifier_tap.press(key, tap_class, time);
                                 }
                                 crate::runtime_key_binding::RuntimeKeyBindingPhase::Release => {
-                                    if let Some(class) = tap_class
-                                        && data.tap_armed_modifier == Some(class)
-                                        && !data.tap_interrupted
+                                    if let Some(tap) =
+                                        data.modifier_tap.release(key, tap_class, time)
                                     {
-                                        let held_ms = time.wrapping_sub(data.tap_armed_at);
                                         for binding in runtime_key_bindings.iter() {
                                             if binding.phase
                                                 == crate::runtime_key_binding::RuntimeKeyBindingPhase::Release
                                                 && binding.shortcut.modifier_class()
-                                                    == Some(class)
+                                                    == Some(tap.class)
                                                 && binding
                                                     .within_ms
-                                                    .is_none_or(|within| held_ms <= within)
+                                                    .is_none_or(|within| tap.held_ms <= within)
                                             {
                                                 data.pending_tap_binding_ids
                                                     .push(binding.id.clone());
                                             }
                                         }
-                                    }
-                                    data.tap_pressed_keys =
-                                        data.tap_pressed_keys.saturating_sub(1);
-                                    if data.tap_pressed_keys == 0 {
-                                        data.tap_armed_modifier = None;
-                                        data.tap_interrupted = false;
                                     }
                                 }
                             }
@@ -1038,7 +1144,7 @@ impl ShojiWM {
                             // VT switch). Releases of keys held when the grab
                             // started also reach the client that saw the press.
                             if let Some(grab) = data.runtime_input_grab.as_mut() {
-                                data.tap_interrupted = true;
+                                data.modifier_tap.interrupt();
                                 let raw = handle.raw_latin_sym_or_raw_current_sym();
                                 let builtin = matches!(
                                     key_phase,
@@ -1163,26 +1269,7 @@ impl ShojiWM {
                             } else if matches!(
                                 key_phase,
                                 crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
-                            ) && modifiers.ctrl
-                                && modifiers.alt
-                                && !modifiers.shift
-                                && !modifiers.logo
-                                && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
-                                && let Some(vt) = match raw.raw() {
-                                    keysyms::KEY_F1 => Some(1),
-                                    keysyms::KEY_F2 => Some(2),
-                                    keysyms::KEY_F3 => Some(3),
-                                    keysyms::KEY_F4 => Some(4),
-                                    keysyms::KEY_F5 => Some(5),
-                                    keysyms::KEY_F6 => Some(6),
-                                    keysyms::KEY_F7 => Some(7),
-                                    keysyms::KEY_F8 => Some(8),
-                                    keysyms::KEY_F9 => Some(9),
-                                    keysyms::KEY_F10 => Some(10),
-                                    keysyms::KEY_F11 => Some(11),
-                                    keysyms::KEY_F12 => Some(12),
-                                    _ => None,
-                                }
+                            ) && let Some(vt) = vt_switch_target(modifiers, &handle)
                             {
                                 FilterResult::Intercept(KeyboardAction::ChangeVt(vt))
                             } else {
@@ -1204,15 +1291,7 @@ impl ShojiWM {
                     KeyboardAction::LogMarker(digit) => {
                         tracing::info!(marker = digit, "log marker");
                     }
-                    KeyboardAction::ChangeVt(vt) => {
-                        if let Some(ref mut session) = self.tty_session {
-                            if let Err(err) = session.change_vt(vt) {
-                                warn!(?err, vt, "failed to change VT");
-                            }
-                        } else {
-                            debug!(vt, "ignoring VT change req (no tty  session)")
-                        }
-                    }
+                    KeyboardAction::ChangeVt(vt) => self.change_vt(vt),
                     KeyboardAction::Forward => {}
                 }
 
@@ -1240,31 +1319,32 @@ impl ShojiWM {
                 let mut confine_region = None;
 
                 if let Some((surface, surface_origin)) = under.as_ref()
-                    && pointer.current_focus().as_ref() == Some(surface) {
-                        with_pointer_constraint(surface, &pointer, |constraint| {
-                            let Some(constraint) =
-                                constraint.filter(|constraint| constraint.is_active())
-                            else {
-                                return;
-                            };
-                            if !constraint.region().is_none_or(|region| {
-                                // Floor, not round: the pointer clamp above can
-                                // sit half a logical pixel inside the trailing
-                                // edge, and rounding would carry that back out
-                                // of the region it is actually within.
-                                region.contains((previous_pos - *surface_origin).to_i32_floor())
-                            }) {
-                                return;
+                    && pointer.current_focus().as_ref() == Some(surface)
+                {
+                    with_pointer_constraint(surface, &pointer, |constraint| {
+                        let Some(constraint) =
+                            constraint.filter(|constraint| constraint.is_active())
+                        else {
+                            return;
+                        };
+                        if !constraint.region().is_none_or(|region| {
+                            // Floor, not round: the pointer clamp above can
+                            // sit half a logical pixel inside the trailing
+                            // edge, and rounding would carry that back out
+                            // of the region it is actually within.
+                            region.contains((previous_pos - *surface_origin).to_i32_floor())
+                        }) {
+                            return;
+                        }
+                        match &*constraint {
+                            PointerConstraint::Locked(_) => pointer_locked = true,
+                            PointerConstraint::Confined(confined) => {
+                                pointer_confined = true;
+                                confine_region = confined.region().cloned();
                             }
-                            match &*constraint {
-                                PointerConstraint::Locked(_) => pointer_locked = true,
-                                PointerConstraint::Confined(confined) => {
-                                    pointer_confined = true;
-                                    confine_region = confined.region().cloned();
-                                }
-                            }
-                        });
-                    }
+                        }
+                    });
+                }
 
                 if pointer_locked {
                     self.publish_xwayland_positions();
@@ -1383,7 +1463,7 @@ impl ShojiWM {
                 pointer.frame(self);
                 self.activate_pointer_constraint_at(pos);
 
-                self.dispatch_pointer_move_events(previous_pos, pos, event.time_msec());
+                self.queue_pointer_move_dispatch(previous_pos, pos, event.time_msec());
                 self.update_pointer_regions(
                     pos,
                     previous_pos + motion_delta - pos,
@@ -1446,7 +1526,7 @@ impl ShojiWM {
                 self.publish_xwayland_positions();
                 pointer.frame(self);
                 self.activate_pointer_constraint_at(pos);
-                self.dispatch_pointer_move_events(previous_pos, pos, event.time_msec());
+                self.queue_pointer_move_dispatch(previous_pos, pos, event.time_msec());
                 // An absolute device cannot push past the layout edge.
                 self.update_pointer_regions(pos, Point::default(), event.time_msec());
                 self.update_decoration_hover_target(pos);
@@ -1465,9 +1545,21 @@ impl ShojiWM {
 
                 let button_state = event.state();
 
+                let button_key = (event.device().id(), button);
+                // The client never saw the intercepted press; do not send its release,
+                // even if Super was released or the session was locked in between.
+                if button_state == ButtonState::Released
+                    && self.consumed_pointer_buttons.remove(&button_key)
+                {
+                    return;
+                }
+                if self.consumed_pointer_buttons.contains(&button_key) {
+                    return;
+                }
+
                 // A pointer button press cancels a pending modifier tap (e.g. Super+drag).
                 if matches!(button_state, ButtonState::Pressed) {
-                    self.tap_interrupted = true;
+                    self.modifier_tap.interrupt();
                 }
 
                 if pointer_button_debug_enabled() {
@@ -1501,6 +1593,21 @@ impl ShojiWM {
                 if self.runtime_input_grab.is_some() {
                     self.input_grab_pointer_button(button, button_state, event.time_msec());
                     return;
+                }
+
+                if button_state == ButtonState::Pressed {
+                    let binding_id = self
+                        .runtime_key_bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.matches_mouse_button(button, &self.current_keyboard_modifiers)
+                        })
+                        .map(|binding| binding.id.clone());
+                    if let Some(binding_id) = binding_id {
+                        self.consumed_pointer_buttons.insert(button_key);
+                        self.run_runtime_key_binding(&binding_id);
+                        return;
+                    }
                 }
 
                 // SSD `<Popup>`s hear about every press: anchors pressed
@@ -1835,9 +1942,7 @@ impl ShojiWM {
                                     },
                                 );
                                 if let Err(error) =
-                                    crate::backend::tty::capture_live_snapshot_for_close(
-                                        self, &window,
-                                    )
+                                    crate::backend::capture_live_snapshot_for_close(self, &window)
                                 {
                                     warn!(
                                         ?error,
@@ -1924,18 +2029,9 @@ impl ShojiWM {
                                 ) {
                                     self.drain_runtime_host_messages();
                                     self.apply_runtime_handler_invocation(&window, &invocation);
-
-                                    if invocation.invoked {
-                                        self.mark_runtime_dirty_windows(
-                                            invocation.dirty_window_ids,
-                                            invocation.dirty_managed_window_ids,
-                                            &invocation.dirty_window_node_ids,
-                                        );
-                                        self.runtime_scheduler_enabled =
-                                            invocation.next_poll_in_ms.is_some();
-                                        self.apply_runtime_window_actions(invocation.actions);
-                                        self.schedule_redraw();
-                                    }
+                                    // Applied whether or not the handler ran: see
+                                    // apply_runtime_handler_mutation.
+                                    self.apply_runtime_handler_mutation(invocation);
                                 }
                             }
                             DecorationHitTestResult::Move => {
@@ -2212,7 +2308,7 @@ impl ShojiWM {
                 if source == AxisSource::Wheel
                     && (horizontal_amount != 0.0 || vertical_amount != 0.0)
                 {
-                    self.tap_interrupted = true;
+                    self.modifier_tap.interrupt();
                     use crate::runtime_key_binding::RuntimeWheelDirection;
                     let vertical_direction = if vertical_amount < 0.0 {
                         Some(RuntimeWheelDirection::Up)
@@ -2235,10 +2331,8 @@ impl ShojiWM {
                             self.runtime_key_bindings
                                 .iter()
                                 .find(|binding| {
-                                    binding.matches_wheel(
-                                        direction,
-                                        &self.current_keyboard_modifiers,
-                                    )
+                                    binding
+                                        .matches_wheel(direction, &self.current_keyboard_modifiers)
                                 })
                                 .map(|binding| binding.id.clone())
                         });
@@ -2287,20 +2381,23 @@ impl ShojiWM {
                     velocity_y: 0.0,
                     grabbed,
                 });
-                self.dispatch_gesture_swipe_events(GestureSwipeEventSnapshot {
-                    phase: GestureSwipePhaseSnapshot::Begin,
-                    fingers,
-                    position,
-                    delta_x: 0.0,
-                    delta_y: 0.0,
-                    total_x: 0.0,
-                    total_y: 0.0,
-                    velocity_x: 0.0,
-                    velocity_y: 0.0,
-                    output_name,
-                    device,
-                    timestamp,
-                }, grabbed);
+                self.dispatch_gesture_swipe_events(
+                    GestureSwipeEventSnapshot {
+                        phase: GestureSwipePhaseSnapshot::Begin,
+                        fingers,
+                        position,
+                        delta_x: 0.0,
+                        delta_y: 0.0,
+                        total_x: 0.0,
+                        total_y: 0.0,
+                        velocity_x: 0.0,
+                        velocity_y: 0.0,
+                        output_name,
+                        device,
+                        timestamp,
+                    },
+                    grabbed,
+                );
             }
             InputEvent::GestureSwipeUpdate { event, .. } => {
                 let grabbed = self
@@ -2347,20 +2444,23 @@ impl ShojiWM {
                 let total_y = gesture.total_y;
                 let velocity_x = gesture.velocity_x;
                 let velocity_y = gesture.velocity_y;
-                self.dispatch_gesture_swipe_events(GestureSwipeEventSnapshot {
-                    phase: GestureSwipePhaseSnapshot::Update,
-                    fingers,
-                    position,
-                    delta_x,
-                    delta_y,
-                    total_x,
-                    total_y,
-                    velocity_x,
-                    velocity_y,
-                    output_name,
-                    device,
-                    timestamp,
-                }, grabbed);
+                self.dispatch_gesture_swipe_events(
+                    GestureSwipeEventSnapshot {
+                        phase: GestureSwipePhaseSnapshot::Update,
+                        fingers,
+                        position,
+                        delta_x,
+                        delta_y,
+                        total_x,
+                        total_y,
+                        velocity_x,
+                        velocity_y,
+                        output_name,
+                        device,
+                        timestamp,
+                    },
+                    grabbed,
+                );
             }
             InputEvent::GestureSwipeEnd { event, .. } => {
                 let grabbed = self
@@ -2394,24 +2494,65 @@ impl ShojiWM {
                 let Some(gesture) = self.runtime_gesture_swipe.take() else {
                     return;
                 };
-                self.dispatch_gesture_swipe_events(GestureSwipeEventSnapshot {
-                    phase: if event.cancelled() {
-                        GestureSwipePhaseSnapshot::Cancel
-                    } else {
-                        GestureSwipePhaseSnapshot::End
+                self.dispatch_gesture_swipe_events(
+                    GestureSwipeEventSnapshot {
+                        phase: if event.cancelled() {
+                            GestureSwipePhaseSnapshot::Cancel
+                        } else {
+                            GestureSwipePhaseSnapshot::End
+                        },
+                        fingers: gesture.fingers,
+                        position,
+                        delta_x: 0.0,
+                        delta_y: 0.0,
+                        total_x: gesture.total_x,
+                        total_y: gesture.total_y,
+                        velocity_x: gesture.velocity_x,
+                        velocity_y: gesture.velocity_y,
+                        output_name,
+                        device,
+                        timestamp,
                     },
-                    fingers: gesture.fingers,
-                    position,
-                    delta_x: 0.0,
-                    delta_y: 0.0,
-                    total_x: gesture.total_x,
-                    total_y: gesture.total_y,
-                    velocity_x: gesture.velocity_x,
-                    velocity_y: gesture.velocity_y,
-                    output_name,
-                    device,
-                    timestamp,
-                }, grabbed);
+                    grabbed,
+                );
+            }
+            // Pinches go to the config only (no client takes them).
+            InputEvent::GesturePinchBegin { event, .. } => {
+                self.runtime_gesture_pinch_fingers = event.fingers();
+                self.dispatch_gesture_pinch(
+                    GestureSwipePhaseSnapshot::Begin,
+                    u64::from(event.time_msec()),
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                );
+            }
+            InputEvent::GesturePinchUpdate { event, .. } => {
+                self.dispatch_gesture_pinch(
+                    GestureSwipePhaseSnapshot::Update,
+                    u64::from(event.time_msec()),
+                    event.scale(),
+                    event.rotation(),
+                    event.delta_x(),
+                    event.delta_y(),
+                );
+            }
+            InputEvent::GesturePinchEnd { event, .. } => {
+                let phase = if event.cancelled() {
+                    GestureSwipePhaseSnapshot::Cancel
+                } else {
+                    GestureSwipePhaseSnapshot::End
+                };
+                self.dispatch_gesture_pinch(
+                    phase,
+                    u64::from(event.time_msec()),
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                );
+                self.runtime_gesture_pinch_fingers = 0;
             }
             _ => {}
         }
@@ -2441,9 +2582,7 @@ impl ShojiWM {
                     .remove(&runtime_action.window_id);
                 self.snapshot_dirty_window_ids
                     .remove(&runtime_action.window_id);
-                let _ = self
-                    .config_runtime
-                    .window_closed(&runtime_action.window_id);
+                let _ = self.config_runtime.window_closed(&runtime_action.window_id);
                 self.runtime_dirty_window_ids
                     .remove(&runtime_action.window_id);
                 self.runtime_managed_only_window_ids
@@ -2484,7 +2623,7 @@ impl ShojiWM {
             match runtime_action.action {
                 crate::ssd::WaylandWindowAction::Close => {
                     if let Err(error) =
-                        crate::backend::tty::capture_live_snapshot_for_close(self, &window)
+                        crate::backend::capture_live_snapshot_for_close(self, &window)
                     {
                         warn!(
                             window_id = runtime_action.window_id,
@@ -2673,8 +2812,7 @@ impl ShojiWM {
         // actions can refresh ManagedWindow immediately, so stage the protocol state first. This
         // keeps that refresh from sending a configure with the new rect and the old Fullscreen
         // state. If no listener accepts the request, restore the pending state below.
-        let xdg_state_changed =
-            self.prepare_xdg_fullscreen_hint(window, &snapshot.id, fullscreen);
+        let xdg_state_changed = self.prepare_xdg_fullscreen_hint(window, &snapshot.id, fullscreen);
         let invoked = self.invoke_window_fullscreen_request_event(&snapshot, &event, now_ms);
         self.finish_xdg_fullscreen_hint(
             window,
@@ -3387,18 +3525,29 @@ impl ShojiWM {
         self.apply_runtime_handler_invocation(window, &invocation);
 
         let invoked = invocation.invoked;
-        if invoked {
-            self.mark_runtime_dirty_windows(
-                invocation.dirty_window_ids,
-                invocation.dirty_managed_window_ids,
-                &invocation.dirty_window_node_ids,
-            );
-            self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
-            self.apply_runtime_window_actions(invocation.actions);
-            self.schedule_redraw();
-        }
-
+        self.apply_runtime_handler_mutation(invocation);
         invoked
+    }
+
+    /// The windows changed and the actions queued that a handler invocation
+    /// carries, applied whether or not the handler ran. The runtime hands
+    /// over every window changed since its last reply with each invocation
+    /// and takes them off its own dirty list: dropping them because this
+    /// handler no longer exists (a hover or press for a node just rebuilt)
+    /// leaves those changes unrefreshed, and the runtime only announces a
+    /// window again once its dirty set is empty, so it never does.
+    pub(crate) fn apply_runtime_handler_mutation(
+        &mut self,
+        invocation: crate::ssd::DecorationHandlerInvocation,
+    ) {
+        self.mark_runtime_dirty_windows(
+            invocation.dirty_window_ids,
+            invocation.dirty_managed_window_ids,
+            &invocation.dirty_window_node_ids,
+        );
+        self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
+        self.apply_runtime_window_actions(invocation.actions);
+        self.schedule_redraw();
     }
 
     pub(crate) fn update_decoration_cursor_icon(
@@ -3427,7 +3576,8 @@ impl ShojiWM {
                     }
                     DecorationHitTestResult::Move
                     | DecorationHitTestResult::Action(_)
-                    | DecorationHitTestResult::Popup                    | DecorationHitTestResult::Outside => Some(CursorIcon::Default),
+                    | DecorationHitTestResult::Popup
+                    | DecorationHitTestResult::Outside => Some(CursorIcon::Default),
                     DecorationHitTestResult::ClientArea => None,
                 })
             })
