@@ -7,9 +7,9 @@ Date: 2026-11-10 (JST). Branch: `integration/upstream-20261110`.
 - Fork base: `e6d5b187f137e5a256a6d4ce984faedbe22d8f71` (`origin/main`).
 - Upstream baseline: `2ae3e7c9a412c4656a3908fedc46637d8ec79c79` ([source](https://github.com/bea4dev/ShojiWM/commit/2ae3e7c9a412c4656a3908fedc46637d8ec79c79)).
 - Common ancestor: `98f84845ebbaabf0cd847d7dc5ac628e5adfccce`.
-- Stage 1: `e71fc2753dca014b8cfc483afd46b3a31e8c4fc5`, upstream plus fork-specific changes, verified before porting PR #7.
-- Stage 2: the following portal changes adapt [PR #7](https://github.com/gentianster/ShojiWM/pull/7), implementation `8ca5abe9672e66edf313d432ed03407bea470c6e`, to that verified baseline.
-- Stage 1 is a normal local snapshot commit, **not a two-parent upstream merge**. Main and PR refs are unchanged. Final upstream parentage remains to be arranged when an actual merge is authorized.
+- Stage 1: merge `52615c3277d2faca82f9313432d4e22e77507bcd`, upstream plus fork-specific changes. Its tree is identical to the originally verified snapshot `e71fc2753dca014b8cfc483afd46b3a31e8c4fc5`.
+- Stage 2: `030c7f9246b0fb9e4238ca1a0c74baff337facb1`, with the exact tree previously verified at `167693183a041edcf94becebeb8c4d7d515977b0`. The following portal changes adapt [PR #7](https://github.com/gentianster/ShojiWM/pull/7), implementation `8ca5abe9672e66edf313d432ed03407bea470c6e`, to that verified baseline.
+- Stage 1 is now a proper two-parent **local integration-branch merge**, with fork `e6d5b18` as first parent and upstream `2ae3e7c` as second parent. Both are confirmed ancestors. Main and PR refs remain unchanged.
 - No push, PR update, merge into main, installed-file replacement, portal restart or desktop restart was performed for this candidate.
 
 The original PR branch, including its local deployment record, remains at `e452e6e0bb382c1fd28de1f936f8fc88c1bfc4cc`. `DESKTOP-BUILD.md` retains that record and describes the previously installed PR #7 build, not this candidate.
@@ -76,7 +76,8 @@ This checklist was recorded before source changes and then updated from complete
 | NumLock | Startup enablement and keymap rebuild restoration/notification retained by source review. Fresh-session keypad/hotplug behavior remains a manual check after authorized deployment. |
 | Session lock | Fork commit-timing barriers and upstream lock/VT/focus protections retained. C timing probe compiled and its no-argument safety refusal was verified. Actual PAM lock/unlock and runtime timing remain untested. |
 | SDK | Typecheck, 8 overlay cases plus fixtures, and 4 output-power cases passed. Dependency lock unchanged. |
-| Personal config | Candidate-SDK and existing-SDK typechecks passed. 67 mocked cases passed: 25 workspace, 20 switcher, 16 overview and 6 QML transitions. Existing dirty files, status and SDK symlink remained unchanged. |
+| Config repository | Candidate-SDK and existing-SDK typechecks passed for `Documents/Codex/desktop-customization/shojiwm-config/shojiwm`. 67 mocked cases passed: 25 workspace, 20 switcher, 16 overview and 6 QML transitions. Existing dirty files, status and SDK symlink remained unchanged. This tree differs from the actual running config; see the separate live-config check below. |
+| Actual live config | `~/.config/shojiwm` passed installed-SDK baseline and candidate-SDK typechecks using isolated temporary compiler settings (TypeScript 5.9.3), including its live-only drag/drop and workspace-drum files. File-list verification confirmed candidate SDK paths and no installed SDK paths in the candidate check. Config/SDK hashes, symlinks and repository statuses remained unchanged. This was static checking only, not V8 execution. |
 | Documentation | Typecheck and English/Japanese production builds passed; docs locks unchanged. |
 | Nix | Not verified: evaluation with invocation-only `nix-command flakes` reached the daemon but failed with Permission denied on `/nix/var/nix/daemon-socket/socket`. No permissions, config, services or lockfiles were changed. |
 | Visual picker QA | Japanese synthetic windows at widths 720 and 360 rendered successfully. Selected, empty and no-match states inspected; footer actions remain visible, long titles wrap, Share is disabled without valid selection. Only each demo's own renderer was saved, never desktop/source content. |
@@ -88,7 +89,62 @@ Final read-only review found no confirmed new blocking regression in the stage-t
 
 The thumbnail worker can interrupt an established Wayland connection. The initial `Connection::connect_to_env()` call occurs before socket registration and is not made interruptible by this patch. Thus a pathological stall during initial connection setup is not covered by the blocked-roundtrip test. Aborting the outer `SelectSources` future also drops its joining guard inline instead of reaching normal `spawn_blocking` teardown; this pre-existing path can still block during that setup edge. Tests cover picker-future abort and thumbnail interruption separately, not an end-to-end outer-future abort. Cancellation during actual asynchronous window opening has state-level coverage only, not a real UI event-order test.
 
-Before installation, choose the final Git integration history and complete review. Do not treat the local checkpoint as an upstream ancestry merge. Live validation should explicitly cover repeated picker open/cancel/share/stop, successful browser frame delivery, stable thumbnail FD/mapping counts after cancellation, NumLock, lock/unlock, and hardware mixed-DPI/XWayland popup positions. Preserve the existing installed-binary rollback plan.
+The local integration history now records upstream ancestry correctly. Publishing this branch, merging it into main and installing it still require explicit decisions. Live validation should explicitly cover repeated picker open/cancel/share/stop, successful browser frame delivery, stable thumbnail FD/mapping counts after cancellation, NumLock, lock/unlock, and hardware mixed-DPI/XWayland popup positions. Preserve the existing installed-binary rollback plan.
+
+## Local history repair after review
+
+Muse reviewed the original candidate read-only and reported no blocking findings. On 2026-11-10, the local branch history was repaired without changing its tested source trees:
+
+| Stage | Original checkpoint | Reconstructed checkpoint |
+| --- | --- | --- |
+| Upstream plus fork changes | `e71fc27` | `52615c3` (two parents) |
+| Portal port | `1676931` | `030c7f9` |
+| Original report and deployment provenance | `6f557fe` | `15bc7ae` |
+
+Each pair has an identical Git tree. The full tree shared by `6f557fe` and `15bc7ae` is `e0e987b94bc810341ab240c4df26f2347f3f64ae`. The original candidate remains reachable through local tag `integration/upstream-20261110-reviewed-snapshot`. The only subsequent content changes are updates to this report.
+
+After reconstruction, the locked workspace build, all-target native harnesses (489 distinct cases, plus 28 duplicated demo cases), four offscreen EGL cases and formatting checks passed again. Evidence is in `ancestry-*.log`, `ancestry-native-results.json` and `ancestry-repair.json` in the local evidence directory. No new checkout, main/PR update, remote publication or live installation was made.
+
+## Live-validation preparation and approval boundary
+
+Read-only host inspection confirmed the running compositor PID 8371 and portal PID 769844 still have the installed hashes below. Session target, portal frontend, GTK backend, ShojiWM backend and FD watcher were active at inspection. Recheck all state immediately before any eventual deployment.
+
+The current config repository and actual runtime configuration are not identical: `~/.config/shojiwm/index.tsx` and `window-manager.ts` differ, and live-only drag/drop, workspace-drum and shader files exist. Both baseline and candidate static checks of the actual live tree now pass; no user config file or SDK link was changed. TypeScript 5.9.3 checked all 10 live TS/TSX roots; the candidate resolution included 36 candidate SDK files and zero installed SDK files. Logs and command details are in `live-config-check/REPORT.md` under the evidence directory.
+
+A behavioral caveat remains: live `index.tsx` forces server decorations and does not set the newly available `kdeDefaultMode` hook. Candidate documentation warns that GTK3/KDE-default clients or clients drawing their own titlebars can behave differently, including possible double titlebars. Typechecking cannot validate this. Include GTK/KDE/client-decorated application titlebars and the live-only drag/workspace/fullscreen interactions in later visual checks; no config behavior was silently changed here.
+
+The compositor must be deployed and rolled back with these matching components:
+
+- `/usr/bin/shoji_wm`
+- `/usr/lib/shojiwm/packages/shoji_wm/`
+- `/usr/lib/shojiwm/tools/decoration-runtime.ts`
+
+Installed SDK/runtime match the old compositor source. Do not hot-reload the candidate runtime into that old compositor. The embedded satellite is part of the compositor build and needs no separate executable install. Preserve user configuration and its existing SDK symlink.
+
+The portal binary is independently replaceable. Its installed service, D-Bus activation file and portal descriptor already match the candidate, so those definitions need no changes. With explicit authorization and no active sharing, a staged atomic binary replacement and restart of only `xdg-desktop-portal-shojiwm.service` can validate the new portal on the old compositor. This would not establish full new-compositor compatibility.
+
+For the full compositor upgrade, agree on a user-controlled logout/login window and install the matching binary/SDK/runtime set while the old session is stopped. Then verify actual running hashes, repeated screen-sharing cancellation and successful frames from a synthetic window, stable FD/mapping counts, NumLock, lock/unlock and mixed-DPI/XWayland popup positions.
+
+Before replacing anything, make fresh verified backups of the current compositor, portal and entire `/usr/lib/shojiwm`. Existing historical binary backups are older than the current installation and are not sufficient rollback points for this upgrade. The portal can be rolled back independently with an idle-backend restart; compositor and SDK/runtime must be restored together for a fresh session.
+
+Do not invoke `dist/install.sh`, `install-portal.sh`, or an install `--no-build` shortcut blindly. They can overwrite installed files, remove the runtime directory and/or restart the portal frontend more broadly than this staged plan. At preparation start the release portal was still the old installed binary and no release compositor existed in this checkout; newly built release hashes must be verified before any installation.
+
+This report does not authorize publication, main merge, installation, session interruption, screen-sharing tests or locking the desktop. Those remain explicit next decisions. Local release preparation and static checks do not change the running session.
+
+## Prepared release artifacts (not installed)
+
+Locked optimized build completed successfully in 5m57s on 2026-11-10 at 19:36 JST:
+
+`nice -n 10 cargo build --locked --release -p shoji_wm -p xdg-desktop-portal-shojiwm -j 4`
+
+The build used source commit `15bc7ae0f07d2ff03ee6a6fa9169fce977391e22`, identical to the reviewed candidate; later edits only update this report. Both files were verified as x86-64 ELF executables. Neither was launched or installed.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `target/release/shoji_wm` | `db54115c4d4d1ee34dbfc94c904a378dda20bc1062dc25f883ba344ec5efdf76` |
+| `target/release/xdg-desktop-portal-shojiwm` | `b948936d8e8e89bd8d4181f070f7142bcb9c39cc4280e052fa193fb880a375dd` |
+
+Logs: `ancestry-release-build.log`, exit marker `0`, and `ancestry-release-hashes.txt` in the evidence directory. Installed binary hashes and protected main/PR refs were rechecked after the build and remain unchanged. Recheck artifact hashes immediately before any later installation because normal Cargo builds can replace target files.
 
 ## Reproduction and evidence
 
