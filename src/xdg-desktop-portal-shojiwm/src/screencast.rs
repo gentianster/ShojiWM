@@ -11,7 +11,8 @@ use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 use crate::picker::{PickResult, PickerHandle};
 use crate::pipewire_stream::{self, StreamHandle, StreamSpec};
 use crate::sources::{
-    self, OutputInfo, SourceInfo, SourceKind, SourceUpdate, ToplevelInfo, source_types,
+    self, OutputInfo, SelectionRequestId, SourceInfo, SourceKind, SourceUpdate, ToplevelInfo,
+    source_types,
 };
 use crate::toplevel_stream::{
     self, CaptureSourceSpec, StreamHandle as ToplevelStreamHandle, StreamSpec as ToplevelStreamSpec,
@@ -54,9 +55,43 @@ struct Inner {
 
 struct SessionState {
     selection: Option<Selection>,
+    selection_request: Option<SelectionRequestId>,
     cursor_visible: bool,
     persist_mode: u32,
     cancelled: tokio::sync::watch::Sender<bool>,
+}
+
+impl SessionState {
+    /// Called while holding the session mutex, so replacement, cancellation and
+    /// configuration changes become visible as one new selection attempt.
+    fn begin_selection(
+        &mut self,
+        request_id: SelectionRequestId,
+        cursor_visible: bool,
+        persist_mode: u32,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        self.cancel_selection();
+        let (cancelled, receiver) = tokio::sync::watch::channel(false);
+        self.cancelled = cancelled;
+        self.selection_request = Some(request_id);
+        self.selection = None;
+        self.cursor_visible = cursor_visible;
+        self.persist_mode = persist_mode;
+        receiver
+    }
+
+    fn cancel_selection(&self) {
+        // Retain cancellation even if Close/replacement precedes the first wait.
+        self.cancelled.send_replace(true);
+    }
+
+    fn set_selection(&mut self, request_id: SelectionRequestId, selection: Selection) -> bool {
+        if self.selection_request != Some(request_id) || *self.cancelled.borrow() {
+            return false;
+        }
+        self.selection = Some(selection);
+        true
+    }
 }
 
 impl Inner {
@@ -73,7 +108,7 @@ impl Inner {
         // cleanup had already run, leaving an unowned PipeWire node that
         // delivered zero frames to the app forever.
         if let Some(session) = self.sessions.lock().unwrap().remove(session_key) {
-            session.cancelled.send_replace(true);
+            session.cancel_selection();
         }
         self.picker.cancel(session_key);
         let stream = self.streams.lock().unwrap().remove(session_key);
@@ -82,13 +117,17 @@ impl Inner {
         tracing::info!(session_key, had_stream, "session closed and cleaned up");
     }
 
-    fn set_selection(&self, session_key: &str, selection: Selection) -> bool {
+    fn set_selection(
+        &self,
+        session_key: &str,
+        request_id: SelectionRequestId,
+        selection: Selection,
+    ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.get_mut(session_key) else {
             return false;
         };
-        session.selection = Some(selection);
-        true
+        session.set_selection(request_id, selection)
     }
 }
 
@@ -334,6 +373,7 @@ impl ScreenCast {
                 session_handle.to_string(),
                 SessionState {
                     selection: None,
+                    selection_request: None,
                     cursor_visible: true,
                     persist_mode: 0,
                     cancelled: tokio::sync::watch::channel(false).0,
@@ -372,14 +412,13 @@ impl ScreenCast {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0);
         let session_key = session_handle.to_string();
+        let request_id = SelectionRequestId::unique();
         let mut cancelled = {
             let mut sessions = self.inner.sessions.lock().unwrap();
             let Some(session) = sessions.get_mut(&session_key) else {
                 return Ok((1, HashMap::new()));
             };
-            session.cursor_visible = cursor_visible;
-            session.persist_mode = persist_mode;
-            session.cancelled.subscribe()
+            session.begin_selection(request_id, cursor_visible, persist_mode)
         };
         let restore_request = options.get("restore_data").and_then(decode_restore_data);
         tracing::info!(
@@ -392,8 +431,13 @@ impl ScreenCast {
         // round-robin until the returned handle is dropped.
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
         let thumbnail_tx = self.inner.thumbnail_tx.clone();
-        let stream_guard =
-            sources::start_thumbnail_stream(session_key.clone(), requested, init_tx, thumbnail_tx);
+        let stream_guard = sources::start_thumbnail_stream(
+            session_key.clone(),
+            request_id,
+            requested,
+            init_tx,
+            thumbnail_tx,
+        );
         let picker_cancelled = cancelled.clone();
         let choose = async {
             let sources = init_rx.await.unwrap_or_default();
@@ -410,6 +454,7 @@ impl ScreenCast {
                 .picker
                 .pick(
                     session_key.clone(),
+                    request_id,
                     sources,
                     picker_cancelled,
                     prefer_windows,
@@ -428,13 +473,16 @@ impl ScreenCast {
             _ = cancelled.wait_for(|closed| *closed) => None,
             selection = choose => selection,
         };
-        self.inner.picker.cancel(&session_key);
+        self.inner.picker.cancel_request(request_id);
         tokio::task::spawn_blocking(move || drop(stream_guard))
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("thumbnail thread join: {e}")))?;
         if let Some(selection) = selection {
             tracing::info!(%session_handle, ?selection, "picker: selected source");
-            if self.inner.set_selection(&session_key, selection) {
+            if self
+                .inner
+                .set_selection(&session_key, request_id, selection)
+            {
                 return Ok((0, HashMap::new()));
             }
         }
@@ -663,6 +711,95 @@ mod tests {
             Selection::Toplevel(top) => Some(top.identifier),
             Selection::Output(_) => None,
         }
+    }
+
+    fn session() -> SessionState {
+        SessionState {
+            selection: None,
+            selection_request: None,
+            cursor_visible: true,
+            persist_mode: 0,
+            cancelled: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    fn selection(identifier: &str) -> Selection {
+        let SourceKind::Toplevel(window) = window(identifier, "App", "Title").kind else {
+            unreachable!();
+        };
+        Selection::Toplevel(window)
+    }
+
+    #[test]
+    fn replacing_selection_cancels_previous_watch_and_resets_state() {
+        let mut session = session();
+        let previous_id = SelectionRequestId::unique();
+        let previous = session.begin_selection(previous_id, true, 2);
+        assert!(session.set_selection(previous_id, selection("old")));
+        let current_id = SelectionRequestId::unique();
+        let current = session.begin_selection(current_id, false, 1);
+        assert!(*previous.borrow());
+        assert!(!*current.borrow());
+        assert_eq!(session.selection_request, Some(current_id));
+        assert!(session.selection.is_none());
+        assert!(!session.cursor_visible);
+        assert_eq!(session.persist_mode, 1);
+    }
+
+    #[test]
+    fn older_completion_cannot_overwrite_current_selection() {
+        let mut session = session();
+        let previous_id = SelectionRequestId::unique();
+        let _previous = session.begin_selection(previous_id, true, 0);
+        let current_id = SelectionRequestId::unique();
+        let _current = session.begin_selection(current_id, false, 2);
+        assert!(!session.set_selection(previous_id, selection("old")));
+        assert!(session.selection.is_none());
+        assert!(session.set_selection(current_id, selection("current")));
+        assert!(!session.set_selection(previous_id, selection("late old")));
+        assert!(
+            matches!(session.selection, Some(Selection::Toplevel(ref window)) if window.identifier == "current")
+        );
+        session.cancel_selection();
+        assert!(!session.set_selection(current_id, selection("after close")));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_first_wait_is_observed_for_close_and_replacement() {
+        for replacement in [false, true] {
+            let mut session = session();
+            let previous_id = SelectionRequestId::unique();
+            let mut previous = session.begin_selection(previous_id, true, 0);
+            if replacement {
+                let _current = session.begin_selection(SelectionRequestId::unique(), true, 0);
+            } else {
+                session.cancel_selection();
+            }
+            // Close removes the sender from the map; a true value must survive
+            // that drop and be observed even before wait_for's first poll.
+            drop(session);
+            let observed = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                previous.wait_for(|closed| *closed),
+            )
+            .await
+            .expect("cancellation must already be observable");
+            assert!(*observed.expect("retained cancellation value"));
+        }
+    }
+
+    #[tokio::test]
+    async fn biased_cancellation_wins_over_an_already_ready_selection() {
+        let mut session = session();
+        let request_id = SelectionRequestId::unique();
+        let mut cancelled = session.begin_selection(request_id, true, 0);
+        session.cancel_selection();
+        let result = tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|closed| *closed) => None,
+            result = async { Some(selection("late")) } => result,
+        };
+        assert!(result.is_none());
     }
 
     #[test]
