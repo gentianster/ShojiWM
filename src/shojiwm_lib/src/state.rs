@@ -54,7 +54,7 @@ use smithay::{
             with_states,
         },
         cursor_shape::CursorShapeManagerState,
-        dmabuf::{DmabufGlobal, DmabufState},
+        dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
         fifo::FifoManagerState,
         fixes::FixesState,
         fractional_scale::FractionalScaleManagerState,
@@ -380,6 +380,8 @@ pub struct ShojiWM {
     pub config_runtime: RuntimeHandle,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
+    /// One shared instance per distinct dmabuf feedback; see `intern_dmabuf_feedback`.
+    pub dmabuf_feedback_pool: Vec<DmabufFeedback>,
     /// The nested (winit) session's check for `dmabuf_imported`: imports the buffer with the
     /// winit renderer. There are no tty backends to try it on there.
     pub winit_dmabuf_import:
@@ -709,6 +711,19 @@ fn detected_subpixel(output: &Output) -> smithay::output::Subpixel {
 const FRAME_DUE_TOLERANCE_MS: f64 = 0.5;
 
 impl ShojiWM {
+    /// Returns the pooled instance equal to `feedback`, adding it if new.
+    ///
+    /// Every frame sends each mapped surface its dmabuf feedback, and smithay
+    /// skips the send when the feedback equals the surface's current one. That
+    /// check is a pointer comparison only when both share one `Arc`; equal
+    /// feedbacks built separately (the global default and an output's render
+    /// feedback) fall back to comparing and hashing the whole format table, and
+    /// smithay keeps the old instance because nothing changed, so the full
+    /// comparison repeats for every surface on every frame.
+    pub fn intern_dmabuf_feedback(&mut self, feedback: DmabufFeedback) -> DmabufFeedback {
+        intern_dmabuf_feedback(&mut self.dmabuf_feedback_pool, feedback)
+    }
+
     fn output_auto_sort_key(output_name: &str) -> (i32, String) {
         let rank = if output_name.starts_with("eDP")
             || output_name.starts_with("LVDS")
@@ -1823,6 +1838,7 @@ impl ShojiWM {
             config_runtime,
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
+            dmabuf_feedback_pool: Vec::new(),
             winit_dmabuf_import: None,
             drm_syncobj_state: None,
             implicit_sync_trusted: false,
@@ -5965,5 +5981,39 @@ mod subpixel_latch_tests {
 
         output.set_subpixel(resolve_output_subpixel(None, detected_subpixel(&output)));
         assert_eq!(output.physical_properties().subpixel, Subpixel::Unknown);
+    }
+}
+
+fn intern_dmabuf_feedback(pool: &mut Vec<DmabufFeedback>, feedback: DmabufFeedback) -> DmabufFeedback {
+    if let Some(existing) = pool.iter().find(|pooled| **pooled == feedback) {
+        return existing.clone();
+    }
+    pool.push(feedback.clone());
+    feedback
+}
+
+#[cfg(test)]
+mod dmabuf_feedback_pool_tests {
+    use super::intern_dmabuf_feedback;
+    use smithay::backend::allocator::{Format, Fourcc, Modifier};
+    use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+
+    fn feedback(fourccs: &[Fourcc]) -> smithay::wayland::dmabuf::DmabufFeedback {
+        let formats = fourccs.iter().map(|&code| Format { code, modifier: Modifier::Linear });
+        DmabufFeedbackBuilder::new(0, formats).build().unwrap()
+    }
+
+    #[test]
+    fn equal_feedbacks_share_one_instance() {
+        let mut pool = Vec::new();
+        let default = intern_dmabuf_feedback(&mut pool, feedback(&[Fourcc::Argb8888, Fourcc::Xrgb8888]));
+        let render = intern_dmabuf_feedback(&mut pool, feedback(&[Fourcc::Argb8888, Fourcc::Xrgb8888]));
+        let other = intern_dmabuf_feedback(&mut pool, feedback(&[Fourcc::Argb8888]));
+        // The second build is equal to the first, so it is not pooled again and the
+        // caller gets the pooled instance back (one Arc, so smithay's equality
+        // check stops at its pointer comparison).
+        assert_eq!(pool.len(), 2);
+        assert!(render == default);
+        assert!(other != default);
     }
 }

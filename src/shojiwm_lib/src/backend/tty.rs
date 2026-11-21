@@ -808,12 +808,14 @@ pub(crate) fn fullscreen_scanout_window(
     let output_name = output.name();
     // `kind` is the edge-trigger key (stable across frames of one animation);
     // `detail` carries the numbers and is only printed when the kind changes.
-    let reject = |kind: &'static str, detail: String| {
+    // `detail` is a closure: it is only formatted when the note is logged,
+    // not on every rejected frame.
+    let reject = |kind: &'static str, detail: &dyn Fn() -> String| {
         note_fullscreen_fast_path_reject(output_name.as_str(), Some((kind, detail)));
         None
     };
     if closing_snapshot_count != 0 {
-        return reject("closing-snapshot", format!("closing snapshots on output: {closing_snapshot_count}"));
+        return reject("closing-snapshot", &|| format!("closing snapshots on output: {closing_snapshot_count}"));
     }
     // Topmost window that actually renders on this output. If that is not
     // the fullscreen window (e.g. a floating window stacked above it), the
@@ -829,7 +831,7 @@ pub(crate) fn fullscreen_scanout_window(
             .element_geometry(window)
             .is_some_and(|geometry| geometry.intersection(output_geo).is_some())
     }) else {
-        return reject("no-window", "no renderable window on output".to_string());
+        return reject("no-window", &|| "no renderable window on output".to_string());
     };
     let describe = |window: &smithay::desktop::Window| {
         window
@@ -855,7 +857,7 @@ pub(crate) fn fullscreen_scanout_window(
             .unwrap_or_else(|| "<no toplevel>".to_string())
     };
     let Some(toplevel) = window.toplevel() else {
-        return reject("no-toplevel", format!("topmost window has no xdg toplevel: {}", describe(window)));
+        return reject("no-toplevel", &|| format!("topmost window has no xdg toplevel: {}", describe(window)));
     };
     let (fullscreen, pending_fullscreen) = {
         let committed = toplevel.with_committed_state(|state| {
@@ -875,7 +877,7 @@ pub(crate) fn fullscreen_scanout_window(
     if !fullscreen {
         return reject(
             if pending_fullscreen { "not-committed" } else { "not-fullscreen" },
-            format!(
+            &|| format!(
                 "topmost window not committed fullscreen (pending_fullscreen={pending_fullscreen}): {}",
                 describe(window)
             ),
@@ -885,7 +887,7 @@ pub(crate) fn fullscreen_scanout_window(
     // fullscreen transition (configure sent, buffer not resized yet) the
     // normal pipeline keeps rendering the scene below.
     let Some(geometry) = space.element_geometry(window) else {
-        return reject("no-geometry", format!("fullscreen window has no geometry: {}", describe(window)));
+        return reject("no-geometry", &|| format!("fullscreen window has no geometry: {}", describe(window)));
     };
     if geometry.intersection(output_geo) != Some(output_geo) {
         // Everything that feeds the space geometry, so a stuck offset can be
@@ -895,7 +897,7 @@ pub(crate) fn fullscreen_scanout_window(
         let decoration = window_decorations.get(window);
         return reject(
             "not-covering",
-            format!(
+            &|| format!(
                 "fullscreen window does not cover output: geometry={geometry:?} output={output_geo:?} \
                  xdg_geometry={:?} bbox={:?} root={:?} client={:?} managed_rect={:?} animation_active={:?} {}",
                 window.geometry(),
@@ -920,7 +922,7 @@ pub(crate) fn fullscreen_scanout_window(
     if !is_identity_visual_geometry(visual_state) || visual_state.opacity < 1.0 {
         return reject(
             "animating",
-            format!(
+            &|| format!(
                 "fullscreen window animating: visual={visual_state:?} root={:?} {}",
                 decoration.layout.root.rect,
                 describe(window)
@@ -953,20 +955,32 @@ const FULLSCREEN_REJECT_DETAIL_INTERVAL: Duration = Duration::from_secs(1);
 /// precondition failed, which is what distinguishes "a bar popped over the
 /// game" from "the client committed an undersized buffer" from "the config
 /// left the window on an animation". Enable with `RUST_LOG=shojiwm_lib=debug`.
-fn note_fullscreen_fast_path_reject(output_name: &str, reason: Option<(&'static str, String)>) {
+fn note_fullscreen_fast_path_reject(
+    output_name: &str,
+    reason: Option<(&'static str, &dyn Fn() -> String)>,
+) {
     let Ok(mut guard) = fullscreen_fast_path_reject_map().lock() else {
         return;
     };
     let now = Instant::now();
     let kind = reason.as_ref().map(|(kind, _)| *kind);
-    let detail = reason.as_ref().map(|(_, detail)| detail.as_str()).unwrap_or_default();
-    let (kind_changed, detail_due) = match guard.get(output_name) {
-        Some((previous_kind, previous_detail, logged_at)) => (
+    let (kind_changed, detail_window_open) = match guard.get(output_name) {
+        Some((previous_kind, _, logged_at)) => (
             *previous_kind != kind,
-            previous_detail != detail && logged_at.elapsed() >= FULLSCREEN_REJECT_DETAIL_INTERVAL,
+            logged_at.elapsed() >= FULLSCREEN_REJECT_DETAIL_INTERVAL,
         ),
         None => (true, false),
     };
+    // Same kind inside the detail interval: nothing can be logged, so skip formatting.
+    if !kind_changed && !detail_window_open {
+        return;
+    }
+    let detail = reason.as_ref().map(|(_, detail)| detail()).unwrap_or_default();
+    let detail = detail.as_str();
+    let detail_due = detail_window_open
+        && guard
+            .get(output_name)
+            .is_some_and(|(_, previous_detail, _)| previous_detail != detail);
     if !kind_changed && !detail_due {
         return;
     }
@@ -2044,9 +2058,11 @@ pub fn device_added(
             unique_modifiers = ?unique_mods_hex,
             "advertising linux-dmabuf modifiers"
         );
-        let default_feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats)
-            .build()
-            .unwrap();
+        let default_feedback = state.intern_dmabuf_feedback(
+            DmabufFeedbackBuilder::new(node.dev_id(), formats)
+                .build()
+                .unwrap(),
+        );
         let global = state
             .dmabuf_state
             .create_global_with_default_feedback::<ShojiWM>(
@@ -12555,6 +12571,10 @@ fn connector_connected(
             unwind_half_connected_output(state, node, &output, &output.name());
             return Err(err);
         }
+    };
+    let dmabuf_feedback = SurfaceDmabufFeedback {
+        render: state.intern_dmabuf_feedback(dmabuf_feedback.render),
+        scanout: state.intern_dmabuf_feedback(dmabuf_feedback.scanout),
     };
 
     let backend = state.tty_backends.get_mut(&node).unwrap();
