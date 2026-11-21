@@ -196,22 +196,40 @@ fn edges(values: [i32; 4]) -> [f32; 4] {
     values.map(|value| value as f32)
 }
 
+struct ClipUniformNames {
+    enabled: &'static str,
+    rect: &'static str,
+    radius: &'static str,
+}
+
+const SHOJI_CLIP_UNIFORMS: ClipUniformNames = ClipUniformNames {
+    enabled: "shoji_clip_enabled",
+    rect: "shoji_clip_rect",
+    radius: "shoji_clip_radius",
+};
+
+const SHOJI_ROUNDED_CLIP_UNIFORMS: ClipUniformNames = ClipUniformNames {
+    enabled: "shoji_rounded_clip_enabled",
+    rect: "shoji_rounded_clip_rect",
+    radius: "shoji_rounded_clip_radius",
+};
+
 fn clip_uniforms(
     uniforms: &mut Vec<Uniform<'static>>,
-    prefix: &str,
+    names: ClipUniformNames,
     clip: Option<PxClip>,
     node: PxRect,
 ) {
     uniforms.push(Uniform::new(
-        format!("{prefix}_enabled"),
+        names.enabled,
         if clip.is_some() { 1.0f32 } else { 0.0 },
     ));
     let clip = clip.unwrap_or(PxClip {
         rect: PxRect::default(),
         radius: [0; 4],
     });
-    uniforms.push(Uniform::new(format!("{prefix}_rect"), rect_relative(clip.rect, node)));
-    uniforms.push(Uniform::new(format!("{prefix}_radius"), edges(clip.radius)));
+    uniforms.push(Uniform::new(names.rect, rect_relative(clip.rect, node)));
+    uniforms.push(Uniform::new(names.radius, edges(clip.radius)));
 }
 
 fn uniforms_for_item(item: &PaintItem) -> Vec<Uniform<'static>> {
@@ -233,8 +251,8 @@ fn uniforms_for_item(item: &PaintItem) -> Vec<Uniform<'static>> {
         Uniform::new("shoji_border_color_left", premultiplied(item.border_colors[3])),
         Uniform::new("shoji_opacity", item.opacity),
     ];
-    clip_uniforms(&mut uniforms, "shoji_clip", g.clip, g.node);
-    clip_uniforms(&mut uniforms, "shoji_rounded_clip", g.rounded_clip, g.node);
+    clip_uniforms(&mut uniforms, SHOJI_CLIP_UNIFORMS, g.clip, g.node);
+    clip_uniforms(&mut uniforms, SHOJI_ROUNDED_CLIP_UNIFORMS, g.rounded_clip, g.node);
 
     let (fill, border) = match item.program {
         PaintProgram::Box { fill, border } => (fill, border),
@@ -373,14 +391,17 @@ impl PaintElementState {
         geometry: Rectangle<i32, Physical>,
         alpha: f32,
     ) -> Result<StablePaintElement, ShaderEffectError> {
-        let spec = PaintSpec {
-            item: item.clone(),
-            geometry,
-            alpha_bits: alpha.to_bits(),
-        };
-        if self.last_spec.as_ref() != Some(&spec) {
+        let alpha_bits = alpha.to_bits();
+        let changed = self.last_spec.as_ref().is_none_or(|last| {
+            last.geometry != geometry || last.alpha_bits != alpha_bits || last.item != *item
+        });
+        if changed {
             self.commit_counter.increment();
-            self.last_spec = Some(spec);
+            self.last_spec = Some(PaintSpec {
+                item: item.clone(),
+                geometry,
+                alpha_bits,
+            });
         }
         Ok(StablePaintElement {
             program: program_for(renderer, item)?,

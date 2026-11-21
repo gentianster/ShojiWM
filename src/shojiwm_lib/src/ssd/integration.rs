@@ -2792,7 +2792,7 @@ impl ShojiWM {
             timescope::scope!("ssd collect live window ids");
             windows
                 .iter()
-                .map(|window| self.snapshot_window(window).id)
+                .map(|window| self.window_runtime_id(window))
                 .collect::<std::collections::HashSet<_>>()
         };
         let window_count = windows.len();
@@ -2870,16 +2870,39 @@ impl ShojiWM {
                     timescope::scope!("ssd window primary output");
                     self.primary_output_name_for_window(&window)
                 };
-                let snapshot = {
-                    timescope::scope!("ssd window snapshot");
-                    self.snapshot_window(&window)
-                };
-                let snapshot_id = snapshot.id.clone();
+                let snapshot_id = self.window_runtime_id(&window);
                 let window_was_runtime_dirty = {
                     timescope::scope!("ssd window dirty lookup");
                     self.runtime_dirty_window_ids.contains(&snapshot_id)
                 };
                 let minimize_debug = minimize_debug_enabled();
+                let should_process = {
+                    timescope::scope!("ssd window process filter");
+                    should_process_window_for_refresh(
+                        primary_output_name.as_deref(),
+                        target_output_name,
+                        force_async_asset_refresh,
+                        force_output_animation_reevaluate,
+                        force_runtime_reevaluate,
+                        window_was_runtime_dirty,
+                    )
+                };
+                if !should_process {
+                    if (runtime_dirty_debug_enabled() || minimize_debug) && window_was_runtime_dirty
+                    {
+                        info!(
+                            window_id = %snapshot_id,
+                            primary_output = ?primary_output_name,
+                            target_output = ?target_output_name,
+                            "runtime dirty debug: refresh candidate skipped"
+                        );
+                    }
+                    continue;
+                }
+                let snapshot = {
+                    timescope::scope!("ssd window snapshot");
+                    self.snapshot_window(&window)
+                };
                 if (runtime_dirty_debug_enabled() || minimize_debug) && window_was_runtime_dirty {
                     let cached_snapshot = self
                         .window_decorations
@@ -2908,30 +2931,6 @@ impl ShojiWM {
                         cached_state = ?cached_state,
                         "runtime dirty debug: refresh candidate"
                     );
-                }
-                let should_process = {
-                    timescope::scope!("ssd window process filter");
-                    should_process_window_for_refresh(
-                        primary_output_name.as_deref(),
-                        target_output_name,
-                        force_async_asset_refresh,
-                        force_output_animation_reevaluate,
-                        force_runtime_reevaluate,
-                        window_was_runtime_dirty,
-                    )
-                };
-                if !should_process {
-                    if (runtime_dirty_debug_enabled() || minimize_debug) && window_was_runtime_dirty
-                    {
-                        info!(
-                            window_id = %snapshot_id,
-                            title = %snapshot.title,
-                            primary_output = ?primary_output_name,
-                            target_output = ?target_output_name,
-                            "runtime dirty debug: refresh candidate skipped"
-                        );
-                    }
-                    continue;
                 }
                 if let Some(primary_output_name) = primary_output_name {
                     self.window_primary_output_names
@@ -4925,7 +4924,14 @@ impl ShojiWM {
             .retain(|window_id| live_window_ids.contains(window_id));
         self.runtime_poll_dirty = !self.runtime_dirty_window_ids.is_empty();
         self.async_asset_dirty = false;
-        self.sync_taskbar_window_states();
+        if rebuilt > 0
+            || relayout > 0
+            || runtime_dirty_updates > 0
+            || !removed_windows.is_empty()
+            || animation_active_for_target
+        {
+            self.sync_taskbar_window_states();
+        }
         self.sync_popup_dismissals();
 
         Ok(())

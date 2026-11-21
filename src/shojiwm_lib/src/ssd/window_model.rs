@@ -818,6 +818,17 @@ pub enum WaylandWindowAction {
 }
 
 impl ShojiWM {
+    /// Return the stable runtime ID for a mapped window without building a full snapshot.
+    pub fn window_runtime_id(&self, window: &Window) -> String {
+        if let Some(existing) = self.window_decorations.get(window) {
+            existing.snapshot.id.clone()
+        } else if window.toplevel().is_some() || window.x11_surface().is_some() {
+            runtime_id_for_window(window)
+        } else {
+            "unknown".into()
+        }
+    }
+
     /// Build a TypeScript-facing window snapshot for a mapped window.
     pub fn snapshot_window(&self, window: &Window) -> WaylandWindowSnapshot {
         let Some(toplevel) = window.toplevel() else {
@@ -1170,7 +1181,7 @@ impl ShojiWM {
                 .window_decorations
                 .get(window)
                 .map(|decoration| decoration.snapshot.id.clone())
-                .unwrap_or_else(|| self.snapshot_window(window).id);
+                .unwrap_or_else(|| self.window_runtime_id(window));
             for (popup, popup_offset) in window_popups {
                 let popup_geometry = popup.geometry();
                 let global = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
