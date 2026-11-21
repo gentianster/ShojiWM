@@ -102,8 +102,17 @@ impl WlrForeignToplevelHandle {
     }
 
     fn set_home_outputs(&self, outputs: &[Output]) {
-        let names: Vec<String> = outputs.iter().map(Output::name).collect();
-        self.inner.lock().unwrap().home_outputs = names;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.home_outputs.len() == outputs.len()
+            && inner
+                .home_outputs
+                .iter()
+                .zip(outputs)
+                .all(|(name, output)| name == &output.name())
+        {
+            return;
+        }
+        inner.home_outputs = outputs.iter().map(Output::name).collect();
     }
 
     fn window_id(&self) -> String {
