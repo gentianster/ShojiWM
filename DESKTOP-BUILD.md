@@ -70,11 +70,13 @@ this build setup does not claim to fix clipboard behavior or retry until success
 
 - **shoji_wm** (compositor)
   - Installed at: `/usr/bin/shoji_wm`
-  - sha256: `6cbe48afa897195037ccbbd1fbf6da6e385854d26d11e123b527fda2e5803f10`
-  - Source: gentianster/ShojiWM `b947f690b29fae64fe2397c1fbecfb7fe758d578`
-    (main; merge of PR #5, session-lock commit-timing fix `aae6391`)
+  - sha256: `4499b4ea62ba232b88326057c5001f00ce262b75d91cb75de7cfb78bae009a5f`
+  - Source: gentianster/ShojiWM `1b5fe1e2c1a857f217bfc0afcda4b6fbdb81b2f9`
+    (main; merge of PR #11, cherry-pick of upstream bea4dev/ShojiWM#187:
+    config-error overlay auto-clear)
   - Built on gebuntu with system cargo/rustc 1.93.1 (see the toolchain note above).
-  - Live-verified by the user on 2026-11-07 (lock screen locks and unlocks).
+  - Deployed 2026-11-27; takes effect at the next session start (the running
+    session kept the previous binary's inode).
 - **xwayland-satellite** (build-time dependency of the compositor)
   - Pinned in `Cargo.lock` to gentianster/xwayland-satellite
     `06511b6d08665ed55f4966f2e24fa387e58c9d17` (version 0.8.3).
@@ -96,7 +98,9 @@ this build setup does not claim to fix clipboard behavior or retry until success
 - Stage the new binary, verify its sha256, then atomically rename it into place
   with `mv -T` (a running session keeps the old inode).
 - Keep the replaced binary as `/usr/bin/.shoji_wm.before-<name>`.
-- Current backups on gebuntu: `.before-session-lock-fix-20261107`
+- Current backups on gebuntu: `.before-overlay-autoclear-20261127`
+  (sha256 `8fb72b58d5b20aa2dcb11956e9a4466c044c8babbb0f77ad5300be819e3179ce`),
+  `.before-session-lock-fix-20261107`
   (sha256 `46f6dba6b2a8696b0b182ef96e21043cb2a3e30de75715ff53b3c37c642270cd`),
   `.before-satellite-pin-20261107`, `.before-integration-20261107`,
   `.before-rebuild-20261107`, `.before-numlock`, `.before-fullscreen-fix`,
